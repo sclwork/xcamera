@@ -22,6 +22,8 @@
 #include <media/NdkImageReader.h>
 #include <camera/NdkCameraDevice.h>
 #include <camera/NdkCameraManager.h>
+#include <SLES/OpenSLES.h>
+#include <SLES/OpenSLES_Android.h>
 
 #define log_d(...)  __android_log_print(ANDROID_LOG_DEBUG, "xcamera", __VA_ARGS__)
 #define log_e(...)  __android_log_print(ANDROID_LOG_ERROR, "xcamera", __VA_ARGS__)
@@ -282,7 +284,125 @@ namespace x {
     /*
      *
      */
+    class Audio;
+    class AudioFrame {
+    public:
+        AudioFrame(): offset(0), size(0), cache(nullptr) {
+        }
+
+        explicit AudioFrame(int32_t sz): offset(0), size(sz),
+                                         cache((uint8_t*)malloc(sizeof(uint8_t)*size)) {
+        }
+
+        AudioFrame(AudioFrame&& frame) noexcept: offset(0), size(frame.size),
+                                                 cache((uint8_t*)malloc(sizeof(uint8_t)*size)) {
+            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+        }
+
+        AudioFrame(const AudioFrame &frame): offset(0), size(frame.size),
+                                             cache((uint8_t*)malloc(sizeof(uint8_t)*size)) {
+            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+        }
+
+        AudioFrame& operator=(AudioFrame&& frame) noexcept {
+            if (size != frame.size) {
+                size = frame.size;
+                if (cache) free(cache);
+                cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
+            }
+            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            return *this;
+        }
+
+        AudioFrame& operator=(const AudioFrame &frame) noexcept {
+            if (size != frame.size) {
+                size = frame.size;
+                if (cache) free(cache);
+                cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
+            }
+            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            return *this;
+        }
+
+        ~AudioFrame() {
+            if (cache) free(cache);
+        }
+
+    public:
+        /**
+         * check audio available
+         */
+        bool available() const {
+            return cache != nullptr;
+        }
+        /**
+         * get audio frame args/pcm data
+         * @param out_size [out] audio pcm data size
+         * @param out_cache [out] audio pcm data pointer
+         */
+        void get(int32_t *out_size, uint8_t **out_cache = nullptr) const {
+            if (out_size) *out_size = size;
+            if (out_cache) *out_cache = cache;
+        }
+        /**
+         * get audio frame pcm short data
+         * @param out_size [out] audio pcm short data size
+         * @return audio frame pcm short data pointer
+         */
+        std::shared_ptr<uint16_t> get(int32_t *out_size) const {
+            if (out_size) *out_size = size / 2;
+            auto sa = new uint16_t[size / 2];
+            std::shared_ptr<uint16_t> sht(sa,[](const uint16_t*p){delete[]p;});
+            for (int32_t i = 0; i < size / 2; i++) {
+                sa[i] = ((uint16_t)(cache[i * 2])     & 0xff) +
+                        (((uint16_t)(cache[i * 2 + 1]) & 0xff) << 8);
+            }
+            return sht;
+        }
+        /**
+         * set short data to audio frame pcm
+         * @param sht audio pcm short data
+         * @param length audio pcm short data size
+         */
+        void set(const uint16_t *sht, int32_t length) {
+            if (sht != nullptr && length > 0 && length * 2 == size && cache != nullptr) {
+                for (int32_t i = 0; i < length; i++) {
+                    cache[i * 2]     = (uint8_t) (sht[i]        & 0xff);
+                    cache[i * 2 + 1] = (uint8_t)((sht[i] >> 8)  & 0xff);
+                }
+            }
+        }
+
+        void set(const std::shared_ptr<uint16_t> &sht, int32_t length) {
+            if (sht != nullptr && length > 0 && length * 2 == size && cache != nullptr) {
+                uint16_t *sd = sht.get();
+                for (int32_t i = 0; i < length; i++) {
+                    cache[i * 2]     = (uint8_t) (sd[i]        & 0xff);
+                    cache[i * 2 + 1] = (uint8_t)((sd[i] >> 8)  & 0xff);
+                }
+            }
+        }
+
+    private:
+        friend class Audio;
+
+    private:
+        int32_t  offset;
+        int32_t  size;
+        uint8_t *cache;
+    };
+
+
+    /*
+     *
+     */
     typedef moodycamel::ConcurrentQueue<ImageFrame> ImageQueue;
+
+
+    /*
+     *
+     */
+    typedef moodycamel::ConcurrentQueue<AudioFrame> AudioQueue;
 
 
     /*
@@ -1035,11 +1155,13 @@ namespace x {
             }
 
             if (id.empty()) {
+                release();
                 return false;
             }
 
             ACameraManager *mgr = ACameraManager_create();
             if (mgr == nullptr) {
+                release();
                 return false;
             }
 
@@ -1050,22 +1172,24 @@ namespace x {
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to get camera meta data.", id.c_str());
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
             getFps(metadata);
-            log_d("Camera[%s] preview fps: %d,%d.", id.c_str(), fps_range[0], fps_range[1]);
+//            log_d("Camera[%s] preview fps: %d,%d.", id.c_str(), fps_range[0], fps_range[1]);
             getOrientation(metadata);
-            log_d("Camera[%s] preview sensor orientation: %d.", id.c_str(), ori);
+//            log_d("Camera[%s] preview sensor orientation: %d.", id.c_str(), ori);
             getAfMode(metadata);
-            log_d("Camera[%s] select af mode: %d.", id.c_str(), af_mode);
+//            log_d("Camera[%s] select af mode: %d.", id.c_str(), af_mode);
             int32_t width = 0, height = 0;
             getSize(metadata, req_w, req_h, &width, &height);
-            log_d("Camera[%s] preview size: %d,%d.", id.c_str(), width, height);
+//            log_d("Camera[%s] preview size: %d,%d.", id.c_str(), width, height);
 
             if (width <= 0 || height <= 0) {
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
@@ -1074,6 +1198,7 @@ namespace x {
                 AImageReader_delete(reader);
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
@@ -1083,12 +1208,14 @@ namespace x {
                 log_e("Camera[%s] Failed to new image reader.", id.c_str());
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
             if (window) {
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
@@ -1097,6 +1224,7 @@ namespace x {
                 log_e("Camera[%s] Failed to get native window.", id.c_str());
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
@@ -1106,6 +1234,7 @@ namespace x {
                 log_e("Camera[%s] Failed[%d] to open camera device.", id.c_str(), s);
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
@@ -1114,50 +1243,57 @@ namespace x {
                 log_e("Camera[%s] Failed to create capture request.", id.c_str());
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
-            log_d("Camera[%s] Success to create capture request.", id.c_str());
+//            log_d("Camera[%s] Success to create capture request.", id.c_str());
             s = ACaptureSessionOutputContainer_create(&out_container);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to create session output container.", id.c_str());
                 ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
+                release();
                 return false;
             }
 
             // delete / release
             ACameraMetadata_free(metadata);
             ACameraManager_delete(mgr);
-            log_d("Camera[%s] Success to open camera device.", id.c_str());
+//            log_d("Camera[%s] Success to open camera device.", id.c_str());
 
             s = ACameraOutputTarget_create(window, &out_target);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to create CameraOutputTarget.", id.c_str());
+                release();
                 return false;
             }
 
             s = ACaptureRequest_addTarget(cap_request, out_target);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to add CameraOutputTarget.", id.c_str());
+                release();
                 return false;
             }
 
             s = ACaptureSessionOutput_create(window, &out_session);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to create CaptureSessionOutput.", id.c_str());
+                release();
                 return false;
             }
 
             s = ACaptureSessionOutputContainer_add(out_container, out_session);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to add CaptureSessionOutput.", id.c_str());
+                release();
                 return false;
             }
 
             s = ACameraDevice_createCaptureSession(dev, out_container, &css_callbacks, &cap_session);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed[%d] to create CaptureSession.", id.c_str(), s);
+                release();
                 return false;
             }
 
@@ -1186,13 +1322,14 @@ namespace x {
             s = ACameraCaptureSession_setRepeatingRequest(cap_session, nullptr, 1, &cap_request, nullptr);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to set RepeatingRequest.", id.c_str());
+                release();
                 return false;
             }
 
             if (out_fps) *out_fps = fps_range[0];
             state = CameraState::Previewing;
-            log_d("Camera[%s] Success to start preview; req size: %d,%d; pre size: %d,%d.",
-                  id.c_str(), req_w, req_h, width, height);
+            log_d("Camera[%s] Success to start preview: %d-%d,%d,%d r(%d,%d) p(%d,%d).",
+                  id.c_str(), fps_range[0], fps_range[1], ori, af_mode, req_w, req_h, width, height);
             return true;
         }
 
@@ -1207,6 +1344,21 @@ namespace x {
          * close camera preview
          */
         void close() {
+            release();
+            if (state != CameraState::None) {
+                state = CameraState::None;
+                log_d("Camera[%s] Success to close CameraDevice.", id.c_str());
+            }
+        }
+
+    private:
+        Camera(Camera&&) = delete;
+        Camera(const Camera&) = delete;
+        Camera& operator=(Camera&&) = delete;
+        Camera& operator=(const Camera&) = delete;
+
+    private:
+        void release() {
             if (cap_request) {
                 ACaptureRequest_free(cap_request);
                 cap_request = nullptr;
@@ -1237,20 +1389,8 @@ namespace x {
                 ANativeWindow_release(window);
                 window = nullptr;
             }
-
-            if (state != CameraState::None) {
-                state = CameraState::None;
-                log_d("Camera[%s] Success to close CameraDevice.", id.c_str());
-            }
         }
 
-    private:
-        Camera(Camera&&) = delete;
-        Camera(const Camera&) = delete;
-        Camera& operator=(Camera&&) = delete;
-        Camera& operator=(const Camera&) = delete;
-
-    private:
         void getFps(ACameraMetadata *metadata) {
             if (metadata == nullptr) {
                 return;
@@ -1492,6 +1632,279 @@ namespace x {
     /*
      *
      */
+    class Audio {
+    public:
+        explicit Audio(uint32_t cls = 2,
+                       uint32_t spr = 44100): eng_obj(nullptr), eng_eng(nullptr),
+                                              rec_obj(nullptr), rec_eng(nullptr), rec_queue(nullptr),
+                                              channels(cls<=1?1:2), sampling_rate(spr==44100?SL_SAMPLINGRATE_44_1:SL_SAMPLINGRATE_16),
+                                              sample_rate(sampling_rate / 1000), pcm_data((uint8_t*)malloc(sizeof(uint8_t)*(PCM_BUF_SIZE))),
+                                              frm_size(1024*2*channels), frm_changed(false), cache(frm_size), frame(frm_size),
+                                              frame_callback(nullptr), frame_ctx(nullptr) {
+            log_d("Audio[%d,%d] created.", channels, sample_rate);
+            initObjects();
+        }
+
+        ~Audio() {
+            if (rec_obj) {
+                (*rec_obj)->Destroy(rec_obj);
+                rec_obj = nullptr;
+            }
+            if (eng_obj) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+            }
+            if (pcm_data) {
+                free(pcm_data);
+                pcm_data = nullptr;
+            }
+            log_d("Audio[%d,%d] release.", channels, sample_rate);
+        }
+
+    public:
+        /**
+         * @return true: audio recorder recording
+         */
+        bool recording() const {
+            if (!recordable()) {
+                return false;
+            }
+            SLuint32 state;
+            SLresult res = (*rec_eng)->GetRecordState(rec_eng, &state);
+            return res == SL_RESULT_SUCCESS && state == SL_RECORDSTATE_RECORDING;
+        }
+        /**
+         * start audio record
+         * @return true: start success
+         */
+        bool startRecord(void (*frm_callback)(void *) = nullptr, void *ctx = nullptr) {
+            if (!recordable()) {
+                return false;
+            }
+            if (!enqueue(false)) {
+                return false;
+            }
+            SLresult res = (*rec_eng)->SetRecordState(rec_eng, SL_RECORDSTATE_RECORDING);
+            if (res != SL_RESULT_SUCCESS) {
+                return false;
+            }
+            frame_callback = frm_callback;
+            frame_ctx = ctx;
+            log_d("Audio[%d,%d] start record.", channels, sample_rate);
+            return true;
+        }
+        /**
+         * stop audio record
+         */
+        void stopRecord() {
+            if (!recording()) {
+                return;
+            }
+            (*rec_eng)->SetRecordState(rec_eng, SL_RECORDSTATE_STOPPED);
+            log_d("Audio[%d,%d] stop record.", channels, sample_rate);
+        }
+        /**
+         * collect an audio frame
+         * @param changed true: audio frame data cache changed
+         * @return collect success audio_frame, all return audio_frame is same address
+         */
+        bool collectFrame(AudioFrame &frm, bool *changed = nullptr) {
+            bool chg = frm_changed;
+            if (chg) {
+                frm = frame;
+            }
+            if (changed != nullptr) {
+                *changed = frm_changed;
+            }
+            frm_changed = false;
+            return chg;
+        }
+
+    public:
+        /**
+         * @return pcm channels num
+         */
+        uint32_t getChannels() const { return channels; }
+        /**
+         * @return pcm sample rate
+         */
+        uint32_t getSampleRate() const { return sample_rate; }
+        /**
+         * @return audio frame data size
+         */
+        uint32_t getFrameSize() const { return frm_size; }
+
+    private:
+        void initObjects() {
+            SLresult res;
+            SLmillisecond period;
+            res = slCreateEngine(&eng_obj, 0, nullptr, 0, nullptr, nullptr);
+            if (res != SL_RESULT_SUCCESS) {
+                log_e("Audio[%d,%d] create eng obj fail. %d.", channels, sample_rate, res);
+                return;
+            }
+            res = (*eng_obj)->Realize(eng_obj, SL_BOOLEAN_FALSE);
+            if (res != SL_RESULT_SUCCESS) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+                log_e("Audio[%d,%d] realize eng obj fail. %d.", channels, sample_rate, res);
+                return;
+            }
+            res = (*eng_obj)->GetInterface(eng_obj, SL_IID_ENGINE, &eng_eng);
+            if (res != SL_RESULT_SUCCESS) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+                log_e("Audio[%d,%d] get eng eng fail. %d.", channels, sample_rate, res);
+                return;
+            }
+            SLDataLocator_IODevice ioDevice = {
+                    SL_DATALOCATOR_IODEVICE,
+                    SL_IODEVICE_AUDIOINPUT,
+                    SL_DEFAULTDEVICEID_AUDIOINPUT,
+                    nullptr
+            };
+            SLDataSource dataSrc = { &ioDevice, nullptr };
+            SLDataLocator_AndroidSimpleBufferQueue bufferQueue = {
+                    SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 20 };
+            SLDataFormat_PCM formatPcm = {
+                    SL_DATAFORMAT_PCM, channels, sampling_rate,
+                    SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16,
+                    channels==1?SL_SPEAKER_FRONT_CENTER:SL_SPEAKER_FRONT_LEFT|SL_SPEAKER_FRONT_RIGHT,
+                    SL_BYTEORDER_LITTLEENDIAN
+            };
+            SLDataSink audioSink = { &bufferQueue, &formatPcm };
+            const SLInterfaceID iid[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_ANDROIDCONFIGURATION };
+            const SLboolean req[] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE };
+            res = (*eng_eng)->CreateAudioRecorder(eng_eng, &rec_obj, &dataSrc, &audioSink, 2, iid, req);
+            if (res != SL_RESULT_SUCCESS) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+                eng_eng = nullptr;
+                log_e("Audio[%d,%d] create audio recorder fail. %d.", channels, sample_rate, res);
+                return;
+            }
+            res = (*rec_obj)->Realize(rec_obj, SL_BOOLEAN_FALSE);
+            if (res != SL_RESULT_SUCCESS) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+                eng_eng = nullptr;
+                (*rec_obj)->Destroy(rec_obj);
+                rec_obj = nullptr;
+                log_e("Audio[%d,%d] realize audio recorder fail. %d.", channels, sample_rate, res);
+                return;
+            }
+            res = (*rec_obj)->GetInterface(rec_obj, SL_IID_RECORD, &rec_eng);
+            if (res != SL_RESULT_SUCCESS) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+                eng_eng = nullptr;
+                (*rec_obj)->Destroy(rec_obj);
+                rec_obj = nullptr;
+                log_e("Audio[%d,%d] get audio recorder fail. %d.", channels, sample_rate, res);
+                return;
+            }
+            (*rec_eng)->SetPositionUpdatePeriod(rec_eng, PERIOD_TIME);
+            (*rec_eng)->GetPositionUpdatePeriod(rec_eng, &period);
+//            log_d("Audio[%d,%d] period millisecond: %dms", channels, sample_rate, period);
+            res = (*rec_obj)->GetInterface(rec_obj, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &rec_queue);
+            if (res != SL_RESULT_SUCCESS) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+                eng_eng = nullptr;
+                (*rec_obj)->Destroy(rec_obj);
+                rec_obj = nullptr;
+                log_e("Audio[%d,%d] get audio recorder queue fail. %d.", channels, sample_rate, res);
+                return;
+            }
+            res = (*rec_queue)->RegisterCallback(rec_queue, queueCallback, this);
+            if (res != SL_RESULT_SUCCESS) {
+                (*eng_obj)->Destroy(eng_obj);
+                eng_obj = nullptr;
+                eng_eng = nullptr;
+                (*rec_obj)->Destroy(rec_obj);
+                rec_obj = nullptr;
+                log_e("Audio[%d,%d] queue register callback fail. %d.", channels, sample_rate, res);
+                return;
+            }
+//            log_d("Audio[%d,%d] init success.", channels, sample_rate);
+        }
+
+        bool recordable() const {
+            return rec_obj   != nullptr &&
+                   rec_eng   != nullptr &&
+                   rec_queue != nullptr;
+        }
+
+        bool enqueue(bool chk_recording) {
+            if (chk_recording && !recording()) {
+                return false;
+            }
+            SLresult res = (*rec_queue)->Enqueue(rec_queue, pcm_data, PCM_BUF_SIZE);
+            return res == SL_RESULT_SUCCESS;
+        }
+
+    private:
+        void handleFrame() {
+            if (cache.offset + PCM_BUF_SIZE > cache.size) {
+                memcpy(frame.cache, cache.cache, sizeof(uint8_t) * cache.offset);
+                int32_t c = cache.size - cache.offset;
+                memcpy(frame.cache + cache.offset, pcm_data, sizeof(uint8_t) * c);
+                frm_changed = true;
+                cache.offset = PCM_BUF_SIZE - c;
+                memcpy(cache.cache, pcm_data + c, sizeof(uint8_t) * cache.offset);
+                if (frame_callback != nullptr) frame_callback(frame_ctx);
+            } else {
+                memcpy(cache.cache + cache.offset, pcm_data, sizeof(uint8_t) * PCM_BUF_SIZE);
+                cache.offset += PCM_BUF_SIZE;
+            }
+        }
+
+    private:
+        static void queueCallback(SLAndroidSimpleBufferQueueItf queue, void *ctx) {
+            auto *rec = (Audio*)ctx;
+            rec->handleFrame();
+            rec->enqueue(true);
+        }
+
+    private:
+        Audio(Audio&&) = delete;
+        Audio(const Audio&) = delete;
+        Audio& operator=(Audio&&) = delete;
+        Audio& operator=(const Audio&) = delete;
+
+    private:
+        // PCM Size=采样率*采样时间*采样位深/8*通道数（Bytes）
+        const int32_t PERIOD_TIME  = 10;  // 10ms
+        const int32_t PCM_BUF_SIZE = 320; // 320bytes
+
+    private:
+        SLObjectItf eng_obj;
+        SLEngineItf eng_eng;
+        SLObjectItf rec_obj;
+        SLRecordItf rec_eng;
+        SLAndroidSimpleBufferQueueItf rec_queue;
+
+    private:
+        uint32_t channels;
+        SLuint32 sampling_rate;
+        uint32_t sample_rate;
+        uint8_t *pcm_data;
+
+    private:
+        uint32_t         frm_size;
+        std::atomic_bool frm_changed;
+        AudioFrame       cache;
+        AudioFrame       frame;
+
+    private:
+        void (*frame_callback)(void *);
+        void *frame_ctx;
+    };
+
+
+    /*
+     *
+     */
     class Recorder {
     public:
         explicit Recorder(const std::string &&cms): cams(cms), cameras(), camFrames(),
@@ -1503,6 +1916,7 @@ namespace x {
                 std::sregex_token_iterator(cams.begin(), cams.end(), re, -1),
                 std::sregex_token_iterator()};
             Camera::enumerate(cameras, ids);
+            audio = std::make_shared<Audio>();
         }
 
         ~Recorder() {
@@ -1510,6 +1924,7 @@ namespace x {
             for (const auto& camera : cameras) { camera->close(); }
             std::vector<std::shared_ptr<Camera>> ec; cameras.swap(ec);
             std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
+            audio.reset();
             log_d("Recorder[%s] release.", cams.c_str());
         }
 
@@ -1533,6 +1948,7 @@ namespace x {
             CollectRunnable = true;
             std::thread ct(Recorder::collectRunnable, this);
             ct.detach();
+            if (audio != nullptr) audio->startRecord(collectAudio, this);
         }
 
         void stopPreview() {
@@ -1540,6 +1956,7 @@ namespace x {
             for (const auto& camera : cameras) {
                 if (camera->previewing()) camera->close();
             }
+            if (audio != nullptr) audio->stopRecord();
         }
 
     private:
@@ -1627,6 +2044,13 @@ namespace x {
             postImageFrame(frame);
         }
 
+        static void collectAudio(void *ctx) {
+            auto *recorder = (Recorder*)ctx;
+            AudioFrame frame;
+            recorder->audio->collectFrame(frame);
+//            log_d("Recorder[%s] collect audio %d.", recorder->cams.c_str(), frame.available());
+        }
+
     private:
         Recorder(Recorder&&) = delete;
         Recorder(const Recorder&) = delete;
@@ -1642,6 +2066,9 @@ namespace x {
 
     private:
         int32_t fps_ms;
+
+    private:
+        std::shared_ptr<Audio> audio;
     };
 } // namespace x
 
