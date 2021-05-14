@@ -14,13 +14,16 @@ import androidx.appcompat.app.AppCompatActivity;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
+    private final String[] C01 = new String[] { "0","1" };
+    private final String[] C10 = new String[] { "1","0" };
+    private String[] cs = C01;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         CameraManager.init(this, findViewById(R.id.gl_view));
-        CameraManager.preview("0", "1");
+        CameraManager.preview(cs);
         checkPermissions();
     }
 
@@ -75,8 +78,15 @@ public class MainActivity extends AppCompatActivity {
         if (noPermission != null) {
             noPermission.setVisibility(hasPermission?View.GONE:View.VISIBLE);
         }
+        Button camera = findViewById(R.id.camera);
         Button effect = findViewById(R.id.effect);
         if (hasPermission) {
+            if (camera != null) camera.setVisibility(View.VISIBLE);
+            if (camera != null) camera.setOnClickListener(v -> {
+                if (cs == C01) cs = C10;
+                else if (cs == C10) cs = C01;
+                CameraManager.preview(cs);
+            });
             if (effect != null) effect.setVisibility(View.VISIBLE);
             if (effect != null) effect.setOnClickListener(v -> {
                 List<String> names = CameraManager.getSupportedEffectPaints();
@@ -94,6 +104,7 @@ public class MainActivity extends AppCompatActivity {
                 listDialog.show();
             });
         } else {
+            if (camera != null) effect.setVisibility(View.GONE);
             if (effect != null) effect.setVisibility(View.GONE);
         }
     }

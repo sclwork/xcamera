@@ -860,6 +860,15 @@ namespace x {
     /*
      *
      */
+    enum class CameraMerge {
+        Vertical,
+        Chat,
+    };
+
+
+    /*
+     *
+     */
     class Camera {
     public:
         Camera(std::string &&_id, int32_t fps): yuv_args(), id(_id), state(CameraState::None), dev(nullptr),
@@ -920,11 +929,13 @@ namespace x {
                     cams.push_back(std::make_shared<Camera>(cameraIdList->cameraIds[i], 30));
                 }
             } else {
-                for (int32_t i = 0; i < cameraIdList->numCameras; i++) {
+                for (const auto& d : ids) {
                     bool has = false;
-                    std::string id(cameraIdList->cameraIds[i]);
-                    for (const auto& d : ids) { if (d == id) { has = true;break; }}
-                    if (has) cams.push_back(std::make_shared<Camera>(std::move(id), 30));
+                    for (int32_t i = 0; i < cameraIdList->numCameras; i++) {
+                        std::string id(cameraIdList->cameraIds[i]);
+                        if (d == id) { has = true;break; }
+                    }
+                    if (has) cams.push_back(std::make_shared<Camera>(std::string(d), 30));
                 }
             }
 
@@ -1562,28 +1573,56 @@ namespace x {
                     }
                 }
             } else if (recorder->cameras.size() > 1) {
-                collectMerge(recorder);
+                collectMerge(recorder, CameraMerge::Chat);
             }
         }
 
-        static void collectMerge(Recorder *recorder) {
+        static void collectMerge(Recorder *recorder, CameraMerge merge = CameraMerge::Vertical) {
             int32_t i = 0, n = recorder->cameras.size();
             for (const auto &camera : recorder->cameras) {
                 if (!camera->previewing()) n--;
             }
             ImageFrame frame(recorder->camWidth, recorder->camHeight);
+            auto *fData = frame.getData();
             for (const auto &camera : recorder->cameras) {
                 if (camera->previewing()) {
-                    camera->getLatestImage(*recorder->camFrames[i]);
+                    if (camera->getLatestImage(*recorder->camFrames[i])) {
+                        if (recorder->camFrames[i]->useMirror()) {
+                            auto *data = recorder->camFrames[i]->getData();
+                            cv::Mat ot(recorder->camHeight, recorder->camWidth, CV_8UC4, data);
+                            cv::flip(ot, ot, 1);
+                        }
+                    }
                     i++;
                 }
             }
-            uint32_t *fData = frame.getData();
-            int32_t iw = recorder->camWidth, ih = recorder->camHeight / n;
-            int32_t ic = (recorder->camHeight - ih) / 2;
-            for (i = 0; i < n; i++) {
-                uint32_t *data = recorder->camFrames[i]->getData();
-                memcpy(fData + i * iw * ih, data + iw * ic, sizeof(uint32_t) * iw * ih);
+            switch (merge) {
+                default:
+                case CameraMerge::Vertical: {
+                    auto iw = recorder->camWidth, ih = recorder->camHeight / n;
+                    auto ic = (recorder->camHeight - ih) / 2;
+                    for (i = 0; i < n; i++) {
+                        auto *data = recorder->camFrames[i]->getData();
+                        memcpy(fData + i * iw * ih, data + iw * ic, sizeof(uint32_t) * iw * ih);
+                    }
+                } break;
+                case CameraMerge::Chat: {
+                    auto iw = recorder->camWidth, ih = recorder->camHeight / (n - 1);
+                    auto ic = (recorder->camHeight - ih) / 2;
+                    for (i = 0; i < (n - 1); i++) {
+                        auto *data = recorder->camFrames[i]->getData();
+                        memcpy(fData + i * iw * ih, data + iw * ic, sizeof(uint32_t) * iw * ih);
+                    }
+                    auto *data = recorder->camFrames[n - 1]->getData();
+                    cv::Mat rt(recorder->camHeight, recorder->camWidth, CV_8UC4, data);
+                    auto dw = (int32_t)(recorder->camWidth  * 0.25f);
+                    auto dh = (int32_t)(recorder->camHeight * 0.25f);
+                    cv::Mat dt(dh, dw, CV_8UC4);
+                    cv::resize(rt, dt, cv::Size(dw, dh));
+                    cv::Mat ft(recorder->camHeight, recorder->camWidth, CV_8UC4, fData);
+                    cv::Mat roi = ft(cv::Rect(ft.cols - dt.cols - 30, 50, dt.cols, dt.rows));
+                    dt.copyTo(roi);
+                } break;
             }
             postImageFrame(frame);
         }

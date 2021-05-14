@@ -12,12 +12,26 @@
         android:layout_height="match_parent" />
 
     <Button
+        android:id="@+id/camera"
+        android:layout_width="100dp"
+        android:layout_height="40dp"
+        android:layout_alignParentLeft="true"
+        android:layout_alignParentBottom="true"
+        android:layout_marginBottom="60dp"
+        android:background="?android:attr/selectableItemBackground"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="#ffffffff"
+        android:text="SWITCH" />
+
+    <Button
         android:id="@+id/effect"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="40dp"
         android:layout_centerHorizontal="true"
         android:layout_alignParentBottom="true"
         android:layout_marginBottom="60dp"
+        android:layout_toRightOf="@id/camera"
         android:background="?android:attr/selectableItemBackground"
         android:textSize="15sp"
         android:textStyle="bold"
@@ -26,9 +40,11 @@
 
     <TextView
         android:id="@+id/no_permissions"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
         android:layout_centerInParent="true"
+        android:background="#cc000000"
+        android:gravity="center"
         android:textColor="#ffeeeeee"
         android:textSize="17sp"
         android:textStyle="bold"
