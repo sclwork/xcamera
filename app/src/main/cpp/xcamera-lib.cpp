@@ -981,6 +981,7 @@ namespace x {
      *
      */
     enum class CameraMerge {
+        Single,
         Vertical,
         Chat,
     };
@@ -1908,7 +1909,7 @@ namespace x {
     class Recorder {
     public:
         explicit Recorder(const std::string &&cms): cams(cms), cameras(), camFrames(),
-                                                    camWidth(0), camHeight(0), fps_ms(0) {
+                                                    camWidth(0), camHeight(0) {
             log_d("Recorder[%s] created.", cams.c_str());
             CollectRunnable = false;
             std::regex re{ "," };
@@ -1921,7 +1922,8 @@ namespace x {
 
         ~Recorder() {
             CollectRunnable = false;
-            for (const auto& camera : cameras) { camera->close(); }
+            for (auto& camera : cameras) { camera.reset(); }
+            for (auto& camFrame : camFrames) { camFrame.reset(); }
             std::vector<std::shared_ptr<Camera>> ec; cameras.swap(ec);
             std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
             audio.reset();
@@ -1929,26 +1931,35 @@ namespace x {
         }
 
     public:
-        void startPreview(int32_t width, int32_t height) {
+        void startPreview(int32_t width, int32_t height, CameraMerge merge = CameraMerge::Single) {
             if (CollectRunnable) return;
             camWidth = width / 2; camHeight = height / 2;
+            for (auto& camFrame : camFrames) { camFrame.reset(); }
+            std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
             if (camFrames.empty()) {
                 for (int32_t i = 0; i < cameras.size(); i++) {
                     camFrames.push_back(std::make_shared<ImageFrame>(camWidth, camHeight));
                 }
             }
             int32_t fps = 0;
-            for (const auto& camera : cameras) {
+            if (merge == CameraMerge::Single) {
+                const auto &camera = cameras.front();
                 if (!camera->previewing()) {
                     camera->preview(camWidth, camHeight, &fps);
                 }
+            } else {
+                for (const auto &camera : cameras) {
+                    if (!camera->previewing()) {
+                        camera->preview(camWidth, camHeight, &fps);
+                    }
+                }
             }
             fps = fps <= 0 ? 30 : fps;
-            fps_ms = (int32_t)(1000.0f / fps);
-            CollectRunnable = true;
-            std::thread ct(Recorder::collectRunnable, this);
-            ct.detach();
+            auto fps_ms = (int32_t)(1000.0f / fps);
             if (audio != nullptr) audio->startRecord(collectAudio, this);
+            CollectRunnable = true;
+            std::thread ct(Recorder::collectRunnable, this, fps_ms, merge);
+            ct.detach();
         }
 
         void stopPreview() {
@@ -1960,28 +1971,24 @@ namespace x {
         }
 
     private:
-        static void collectRunnable(Recorder *recorder) {
+        static void collectRunnable(Recorder *recorder, int32_t fps_ms, CameraMerge merge) {
             log_d("Recorder[%s] collect thread start.", recorder->cams.c_str());
             long ms;
             struct timeval tv{};
             while (CollectRunnable) {
                 gettimeofday(&tv, nullptr);
                 ms = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-                collectCameras(recorder);
+                collectCameras(recorder, merge);
                 gettimeofday(&tv, nullptr);
                 ms = tv.tv_sec * 1000 + tv.tv_usec / 1000 - ms;
-                ms = recorder->fps_ms - ms;
+                ms = fps_ms - ms;
                 if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
             }
             log_d("Recorder[%s] collect thread exit.", recorder->cams.c_str());
         }
 
-        static void collectCameras(Recorder *recorder) {
-            int32_t n = recorder->cameras.size();
-            for (const auto &camera : recorder->cameras) {
-                if (!camera->previewing()) n--;
-            }
-            if (n == 1) {
+        static void collectCameras(Recorder *recorder, CameraMerge merge) {
+            if (merge == CameraMerge::Single) {
                 const auto &camera = recorder->cameras.front();
                 if (camera->previewing()) {
                     ImageFrame frame(recorder->camWidth, recorder->camHeight);
@@ -1989,12 +1996,26 @@ namespace x {
                         postImageFrame(frame);
                     }
                 }
-            } else if (recorder->cameras.size() > 1) {
-                collectMerge(recorder, CameraMerge::Chat);
+            } else {
+                int32_t n = recorder->cameras.size();
+                for (const auto &camera : recorder->cameras) {
+                    if (!camera->previewing()) n--;
+                }
+                if (n == 1) {
+                    const auto &camera = recorder->cameras.front();
+                    if (camera->previewing()) {
+                        ImageFrame frame(recorder->camWidth, recorder->camHeight);
+                        if (camera->getLatestImage(frame)) {
+                            postImageFrame(frame);
+                        }
+                    }
+                } else if (recorder->cameras.size() > 1) {
+                    collectMerge(recorder, merge);
+                }
             }
         }
 
-        static void collectMerge(Recorder *recorder, CameraMerge merge = CameraMerge::Vertical) {
+        static void collectMerge(Recorder *recorder, CameraMerge merge) {
             int32_t i = 0, n = recorder->cameras.size();
             for (const auto &camera : recorder->cameras) {
                 if (!camera->previewing()) n--;
@@ -2015,6 +2036,7 @@ namespace x {
             }
             switch (merge) {
                 default:
+                case CameraMerge::Single:
                 case CameraMerge::Vertical: {
                     auto iw = recorder->camWidth, ih = recorder->camHeight / n;
                     auto ic = (recorder->camHeight - ih) / 2;
@@ -2063,9 +2085,6 @@ namespace x {
         std::vector<std::shared_ptr<ImageFrame>> camFrames;
         int32_t                                  camWidth;
         int32_t                                  camHeight;
-
-    private:
-        int32_t fps_ms;
 
     private:
         std::shared_ptr<Audio> audio;
