@@ -16,6 +16,7 @@ import java.util.List;
 public class MainActivity extends AppCompatActivity {
     private final String[] C01 = new String[] { "0","1" };
     private final String[] C10 = new String[] { "1","0" };
+    private int camMerge = 0;
     private String[] cs = C01;
 
     @Override
@@ -23,7 +24,7 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         CameraManager.init(this, findViewById(R.id.gl_view));
-        CameraManager.preview(cs);
+        CameraManager.preview(camMerge, cs);
         checkPermissions();
     }
 
@@ -80,12 +81,13 @@ public class MainActivity extends AppCompatActivity {
         }
         Button camera = findViewById(R.id.camera);
         Button effect = findViewById(R.id.effect);
+        Button merge = findViewById(R.id.merge);
         if (hasPermission) {
             if (camera != null) camera.setVisibility(View.VISIBLE);
             if (camera != null) camera.setOnClickListener(v -> {
                 if (cs == C01) cs = C10;
                 else if (cs == C10) cs = C01;
-                CameraManager.preview(cs);
+                CameraManager.preview(camMerge, cs);
             });
             if (effect != null) effect.setVisibility(View.VISIBLE);
             if (effect != null) effect.setOnClickListener(v -> {
@@ -103,9 +105,22 @@ public class MainActivity extends AppCompatActivity {
                 });
                 listDialog.show();
             });
+            if (merge != null) merge.setVisibility(View.VISIBLE);
+            if (merge != null) merge.setOnClickListener(v -> {
+                String[] items = new String[] { "SINGLE", "VERTICAL", "CHAT" };
+                AlertDialog.Builder listDialog = new AlertDialog.Builder(this);
+                listDialog.setItems(items, (dialog, which) -> {
+                    String name = items[which];
+                    merge.setText(name);
+                    camMerge = which;
+                    CameraManager.preview(camMerge, cs);
+                });
+                listDialog.show();
+            });
         } else {
-            if (camera != null) effect.setVisibility(View.GONE);
+            if (camera != null) camera.setVisibility(View.GONE);
             if (effect != null) effect.setVisibility(View.GONE);
+            if (merge != null) merge.setVisibility(View.GONE);
         }
     }
 }

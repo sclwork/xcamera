@@ -83,13 +83,13 @@ public class CameraManager {
     /*
      *
      */
-    public static void preview(String... cameras) {
+    public static void preview(int merge, String... cameras) {
         if (cameras.length > 0) {
             StringBuilder sb = new StringBuilder();
             for (String c : cameras) sb.append(",").append(c);
             CameraManager m = SingletonHolder.INSTANCE;
             if (GlView != null && GlView.get() != null) {
-                GlView.get().queueEvent(()->m.jniPreview(sb.substring(1)));
+                GlView.get().queueEvent(()->m.jniPreview(sb.substring(1), merge));
             }
         }
     }
@@ -326,7 +326,7 @@ public class CameraManager {
     private native int jniSurfaceChanged(int width, int height);
     private native int jniUpdatePaint(@NonNull String name);
     private native int jniDrawFrame();
-    private native int jniPreview(@NonNull String cameras);
+    private native int jniPreview(@NonNull String cameras, int merge);
     /*
      *
      */

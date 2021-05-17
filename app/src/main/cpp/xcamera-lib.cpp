@@ -993,12 +993,14 @@ namespace x {
     class Camera {
     public:
         Camera(std::string &&_id, int32_t fps): yuv_args(), id(_id), state(CameraState::None), dev(nullptr),
-                                                fps_req(fps), fps_range(), ori(0), af_mode(ACAMERA_CONTROL_AF_MODE_OFF),
+                                                width(0), height(0), fps_req(fps), fps_range(), iso_range(), ori(0),
+                                                awbs(), af_mode(ACAMERA_CONTROL_AF_MODE_OFF),
                                                 reader(nullptr), window(nullptr), cap_request(nullptr), out_container(nullptr),
                                                 out_session(nullptr), cap_session(nullptr), out_target(nullptr),
                                                 ds_callbacks({nullptr, onDisconnected, onError}),
                                                 css_callbacks({nullptr, onClosed, onReady, onActive}) {
             log_d("Camera[%s] created.", id.c_str());
+            initParams();
         }
 
         ~Camera() {
@@ -1173,22 +1175,13 @@ namespace x {
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to get camera meta data.", id.c_str());
                 ACameraManager_delete(mgr);
-                release();
                 return false;
             }
 
-            getFps(metadata);
-//            log_d("Camera[%s] preview fps: %d,%d.", id.c_str(), fps_range[0], fps_range[1]);
-            getOrientation(metadata);
-//            log_d("Camera[%s] preview sensor orientation: %d.", id.c_str(), ori);
-            getAfMode(metadata);
-//            log_d("Camera[%s] select af mode: %d.", id.c_str(), af_mode);
-            int32_t width = 0, height = 0;
             getSize(metadata, req_w, req_h, &width, &height);
-//            log_d("Camera[%s] preview size: %d,%d.", id.c_str(), width, height);
+            ACameraMetadata_free(metadata);
 
             if (width <= 0 || height <= 0) {
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
@@ -1197,7 +1190,6 @@ namespace x {
             if (reader) {
                 AImageReader_setImageListener(reader, nullptr);
                 AImageReader_delete(reader);
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
@@ -1207,14 +1199,12 @@ namespace x {
                                   AIMAGE_FORMAT_YUV_420_888, 2, &reader);
             if (ms != AMEDIA_OK) {
                 log_e("Camera[%s] Failed to new image reader.", id.c_str());
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
             }
 
             if (window) {
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
@@ -1223,7 +1213,6 @@ namespace x {
             ms = AImageReader_getWindow(reader, &window);
             if (ms != AMEDIA_OK) {
                 log_e("Camera[%s] Failed to get native window.", id.c_str());
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
@@ -1233,7 +1222,6 @@ namespace x {
             s = ACameraManager_openCamera(mgr, id.c_str(), &ds_callbacks, &dev);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed[%d] to open camera device.", id.c_str(), s);
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
@@ -1242,7 +1230,6 @@ namespace x {
             s = ACameraDevice_createCaptureRequest(dev, TEMPLATE_RECORD, &cap_request);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to create capture request.", id.c_str());
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
@@ -1252,14 +1239,12 @@ namespace x {
             s = ACaptureSessionOutputContainer_create(&out_container);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to create session output container.", id.c_str());
-                ACameraMetadata_free(metadata);
                 ACameraManager_delete(mgr);
                 release();
                 return false;
             }
 
             // delete / release
-            ACameraMetadata_free(metadata);
             ACameraManager_delete(mgr);
 //            log_d("Camera[%s] Success to open camera device.", id.c_str());
 
@@ -1392,6 +1377,29 @@ namespace x {
             }
         }
 
+        void initParams() {
+            ACameraManager *mgr = ACameraManager_create();
+            if (mgr == nullptr) {
+                return;
+            }
+
+            ACameraMetadata *metadata = nullptr;
+            camera_status_t s = ACameraManager_getCameraCharacteristics(mgr, id.c_str(), &metadata);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to get camera meta data.", id.c_str());
+                ACameraManager_delete(mgr);
+                return;
+            }
+
+            getOrientation(metadata);
+            getIsoMode(metadata);
+            getAwbMode(metadata);
+            getAfMode(metadata);
+            getFps(metadata);
+
+            ACameraMetadata_free(metadata);
+        }
+
         void getFps(ACameraMetadata *metadata) {
             if (metadata == nullptr) {
                 return;
@@ -1485,6 +1493,45 @@ namespace x {
                     af_mode = ACAMERA_CONTROL_AF_MODE_OFF;
                 }
             }
+        }
+
+        void getIsoMode(ACameraMetadata *metadata) {
+            if (metadata == nullptr) {
+                return;
+            }
+
+            camera_status_t status;
+            ACameraMetadata_const_entry entry;
+            status = ACameraMetadata_getConstEntry(metadata, ACAMERA_SENSOR_INFO_SENSITIVITY_RANGE, &entry);
+            if (status != ACAMERA_OK) {
+                return;
+            }
+
+            iso_range[0] = entry.data.i32[0];
+            iso_range[1] = entry.data.i32[1];
+//            log_d("Camera[%s] ISO: %d,%d.", id.c_str(), iso_range[0], iso_range[1]);
+        }
+
+        void getAwbMode(ACameraMetadata *metadata) {
+            if (metadata == nullptr) {
+                return;
+            }
+
+            camera_status_t status;
+            ACameraMetadata_const_entry entry;
+            status = ACameraMetadata_getConstEntry(metadata, ACAMERA_CONTROL_AWB_AVAILABLE_MODES, &entry);
+            if (status != ACAMERA_OK) {
+                return;
+            }
+
+            std::vector<uint8_t> ea; awbs.swap(ea);
+            for (int32_t i = 0; i < entry.count; i++) {
+                awbs.push_back(entry.data.u8[i]);
+            }
+
+//            std::string awb;
+//            for (const auto& a : awbs) { awb+=","+std::to_string(a); }
+//            log_d("Camera[%s] AWB: %s.", id.c_str(), awb.substr(1).c_str());
         }
 
     private:
@@ -1612,9 +1659,8 @@ namespace x {
         ACameraDevice *dev;
 
     private:
-        int32_t fps_req;
-        int32_t fps_range[2];
-        int32_t ori;
+        int32_t width, height, fps_req, fps_range[2], iso_range[2], ori;
+        std::vector<uint8_t> awbs;
         uint8_t af_mode;
 
     private:
@@ -1906,32 +1952,30 @@ namespace x {
     /*
      *
      */
-    class Recorder {
+    class ImageRecorder {
     public:
-        explicit Recorder(const std::string &&cms): cams(cms), cameras(), camFrames(),
-                                                    camWidth(0), camHeight(0) {
-            log_d("Recorder[%s] created.", cams.c_str());
+        explicit ImageRecorder(const std::string &&cms): cams(cms), cameras(), camFrames(),
+                                                         camWidth(0), camHeight(0) {
+            log_d("ImageRecorder[%s] created.", cams.c_str());
             CollectRunnable = false;
             std::regex re{ "," };
             std::vector<std::string> ids {
                 std::sregex_token_iterator(cams.begin(), cams.end(), re, -1),
                 std::sregex_token_iterator()};
             Camera::enumerate(cameras, ids);
-            audio = std::make_shared<Audio>();
         }
 
-        ~Recorder() {
+        ~ImageRecorder() {
             CollectRunnable = false;
             for (auto& camera : cameras) { camera.reset(); }
             for (auto& camFrame : camFrames) { camFrame.reset(); }
             std::vector<std::shared_ptr<Camera>> ec; cameras.swap(ec);
             std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
-            audio.reset();
-            log_d("Recorder[%s] release.", cams.c_str());
+            log_d("ImageRecorder[%s] release.", cams.c_str());
         }
 
     public:
-        void startPreview(int32_t width, int32_t height, CameraMerge merge = CameraMerge::Single) {
+        void start(int32_t width, int32_t height, CameraMerge merge) {
             if (CollectRunnable) return;
             camWidth = width / 2; camHeight = height / 2;
             for (auto& camFrame : camFrames) { camFrame.reset(); }
@@ -1956,23 +2000,21 @@ namespace x {
             }
             fps = fps <= 0 ? 30 : fps;
             auto fps_ms = (int32_t)(1000.0f / fps);
-            if (audio != nullptr) audio->startRecord(collectAudio, this);
             CollectRunnable = true;
-            std::thread ct(Recorder::collectRunnable, this, fps_ms, merge);
+            std::thread ct(ImageRecorder::collectRunnable, this, fps_ms, merge);
             ct.detach();
         }
 
-        void stopPreview() {
+        void stop() {
             CollectRunnable = false;
             for (const auto& camera : cameras) {
                 if (camera->previewing()) camera->close();
             }
-            if (audio != nullptr) audio->stopRecord();
         }
 
     private:
-        static void collectRunnable(Recorder *recorder, int32_t fps_ms, CameraMerge merge) {
-            log_d("Recorder[%s] collect thread start.", recorder->cams.c_str());
+        static void collectRunnable(ImageRecorder *recorder, int32_t fps_ms, CameraMerge merge) {
+            log_d("ImageRecorder[%s] collect thread start.", recorder->cams.c_str());
             long ms;
             struct timeval tv{};
             while (CollectRunnable) {
@@ -1984,10 +2026,10 @@ namespace x {
                 ms = fps_ms - ms;
                 if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
             }
-            log_d("Recorder[%s] collect thread exit.", recorder->cams.c_str());
+            log_d("ImageRecorder[%s] collect thread exit.", recorder->cams.c_str());
         }
 
-        static void collectCameras(Recorder *recorder, CameraMerge merge) {
+        static void collectCameras(ImageRecorder *recorder, CameraMerge merge) {
             if (merge == CameraMerge::Single) {
                 const auto &camera = recorder->cameras.front();
                 if (camera->previewing()) {
@@ -2015,7 +2057,7 @@ namespace x {
             }
         }
 
-        static void collectMerge(Recorder *recorder, CameraMerge merge) {
+        static void collectMerge(ImageRecorder *recorder, CameraMerge merge) {
             int32_t i = 0, n = recorder->cameras.size();
             for (const auto &camera : recorder->cameras) {
                 if (!camera->previewing()) n--;
@@ -2066,18 +2108,11 @@ namespace x {
             postImageFrame(frame);
         }
 
-        static void collectAudio(void *ctx) {
-            auto *recorder = (Recorder*)ctx;
-            AudioFrame frame;
-            recorder->audio->collectFrame(frame);
-//            log_d("Recorder[%s] collect audio %d.", recorder->cams.c_str(), frame.available());
-        }
-
     private:
-        Recorder(Recorder&&) = delete;
-        Recorder(const Recorder&) = delete;
-        Recorder& operator=(Recorder&&) = delete;
-        Recorder& operator=(const Recorder&) = delete;
+        ImageRecorder(ImageRecorder&&) = delete;
+        ImageRecorder(const ImageRecorder&) = delete;
+        ImageRecorder& operator=(ImageRecorder&&) = delete;
+        ImageRecorder& operator=(const ImageRecorder&) = delete;
 
     private:
         std::string                              cams;
@@ -2085,6 +2120,42 @@ namespace x {
         std::vector<std::shared_ptr<ImageFrame>> camFrames;
         int32_t                                  camWidth;
         int32_t                                  camHeight;
+    };
+
+
+    /*
+     *
+     */
+    class AudioRecorder {
+    public:
+        AudioRecorder(): audio(std::make_shared<Audio>()) {
+            log_d("AudioRecorder created.");
+        }
+
+        ~AudioRecorder() {
+            audio.reset();
+            log_d("AudioRecorder release.");
+        }
+
+    public:
+        void start() {
+            if (audio->recording()) return;
+            audio->startRecord(AudioRecorder::collectAudio, this);
+        }
+
+        void stop() {
+            audio->stopRecord();
+        }
+
+    private:
+        static void collectAudio(void *ctx) {
+        }
+
+    private:
+        AudioRecorder(AudioRecorder&&) = delete;
+        AudioRecorder(const AudioRecorder&) = delete;
+        AudioRecorder& operator=(AudioRecorder&&) = delete;
+        AudioRecorder& operator=(const AudioRecorder&) = delete;
 
     private:
         std::shared_ptr<Audio> audio;
@@ -2099,10 +2170,12 @@ namespace x {
 extern "C" {
 #endif
 
-static jobject           g_MainClass = nullptr;
-static JavaVM           *g_JavaVM    = nullptr;
-static x::ImageRenderer *g_Renderer  = nullptr;
-static x::Recorder      *g_Recorder  = nullptr;
+static jobject           g_MainClass      = nullptr;
+static JavaVM           *g_JavaVM         = nullptr;
+static x::ImageRenderer *g_Renderer       = nullptr;
+static x::ImageRecorder *g_ImageRecorder  = nullptr;
+static x::AudioRecorder *g_AudioRecorder  = nullptr;
+static x::CameraMerge    g_CamMerge       = x::CameraMerge::Single;
 
 static void requestGlRender(void *ctx = nullptr) {
     if (g_JavaVM == nullptr || g_MainClass == nullptr) {
@@ -2170,6 +2243,7 @@ jstring fileRootPath) {
     env->ReleaseStringUTFChars(fileRootPath, file);
     x::EffectName = new std::string("NONE");
     g_Renderer = new x::ImageRenderer(*x::EffectName);
+    g_CamMerge  = x::CameraMerge::Single;
     return 0;
 }
 
@@ -2182,8 +2256,11 @@ JNIEnv *env, jobject thiz) {
 JNIEXPORT jint JNICALL
 Java_com_scliang_x_camera_CameraManager_jniPause(
 JNIEnv *env, jobject thiz) {
-    if (g_Recorder != nullptr) {
-        g_Recorder->stopPreview();
+    if (g_ImageRecorder != nullptr) {
+        g_ImageRecorder->stop();
+    }
+    if (g_AudioRecorder != nullptr) {
+        g_AudioRecorder->stop();
     }
     return 0;
 }
@@ -2199,8 +2276,10 @@ JNIEnv *env, jobject thiz) {
     x::FileRoot = nullptr;
     delete x::EffectName;
     x::EffectName = nullptr;
-    delete g_Recorder;
-    g_Recorder = nullptr;
+    delete g_ImageRecorder;
+    g_ImageRecorder = nullptr;
+    delete g_AudioRecorder;
+    g_AudioRecorder = nullptr;
     delete g_Renderer;
     g_Renderer = nullptr;
     log_d("JNI release.");
@@ -2223,9 +2302,12 @@ jint width, jint height) {
     if (g_Renderer != nullptr) {
         g_Renderer->surfaceChanged(width, height);
     }
-    if (g_Recorder != nullptr && g_Renderer != nullptr &&
-        g_Renderer->getWidth() > 0 && g_Renderer->getHeight() > 0) {
-        g_Recorder->startPreview(g_Renderer->getWidth(), g_Renderer->getHeight());
+    bool startable = g_Renderer!=nullptr&&g_Renderer->getWidth()>0&&g_Renderer->getHeight()>0;
+    if (g_ImageRecorder != nullptr && startable) {
+        g_ImageRecorder->start(g_Renderer->getWidth(), g_Renderer->getHeight(), g_CamMerge);
+    }
+    if (g_AudioRecorder != nullptr && startable) {
+        g_AudioRecorder->start();
     }
     return 0;
 }
@@ -2256,12 +2338,15 @@ JNIEnv *env, jobject thiz) {
 JNIEXPORT jint JNICALL
 Java_com_scliang_x_camera_CameraManager_jniPreview(
 JNIEnv *env, jobject thiz,
-jstring cameras) {
-    delete g_Recorder;
+jstring cameras, jint merge) {
+    delete g_ImageRecorder;
     const char *cams = env->GetStringUTFChars(cameras, nullptr);
-    g_Recorder = new x::Recorder(std::string(cams));
+    g_ImageRecorder = new x::ImageRecorder(std::string(cams));
+    g_CamMerge = (x::CameraMerge)merge;
+    if (g_AudioRecorder == nullptr) g_AudioRecorder = new x::AudioRecorder();
     if (g_Renderer != nullptr && g_Renderer->getWidth() > 0 && g_Renderer->getHeight() > 0) {
-        g_Recorder->startPreview(g_Renderer->getWidth(), g_Renderer->getHeight());
+        g_ImageRecorder->start(g_Renderer->getWidth(), g_Renderer->getHeight(), g_CamMerge);
+        g_AudioRecorder->start();
     }
     env->ReleaseStringUTFChars(cameras, cams);
     return 0;
