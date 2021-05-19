@@ -34,7 +34,6 @@ namespace x {
      */
     static std::string *FileRoot = nullptr;
     static std::string *EffectName = nullptr;
-    static std::atomic_bool CollectRunnable(false);
 
 
     /*
@@ -284,7 +283,6 @@ namespace x {
     /*
      *
      */
-    class Audio;
     class AudioFrame {
     public:
         AudioFrame(): offset(0), size(0), cache(nullptr) {
@@ -408,7 +406,9 @@ namespace x {
     /*
      *
      */
-    static void postImageFrame(ImageFrame &frame);
+    static void postRendererImageFrame(ImageFrame &frame);
+    static void postEncoderImageFrame(ImageFrame &frame);
+    static void postEncoderAudioFrame(AudioFrame &frame);
 
 
     /*
@@ -1952,32 +1952,14 @@ namespace x {
     /*
      *
      */
-    class ImageRecorder {
+    class ImageCollector {
     public:
-        explicit ImageRecorder(const std::string &&cms): cams(cms), cameras(), camFrames(),
-                                                         camWidth(0), camHeight(0) {
-            log_d("ImageRecorder[%s] created.", cams.c_str());
-            CollectRunnable = false;
-            std::regex re{ "," };
-            std::vector<std::string> ids {
-                std::sregex_token_iterator(cams.begin(), cams.end(), re, -1),
-                std::sregex_token_iterator()};
-            Camera::enumerate(cameras, ids);
-        }
-
-        ~ImageRecorder() {
-            CollectRunnable = false;
-            for (auto& camera : cameras) { camera.reset(); }
-            for (auto& camFrame : camFrames) { camFrame.reset(); }
-            std::vector<std::shared_ptr<Camera>> ec; cameras.swap(ec);
-            std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
-            log_d("ImageRecorder[%s] release.", cams.c_str());
-        }
-
-    public:
-        void start(int32_t width, int32_t height, CameraMerge merge) {
-            if (CollectRunnable) return;
-            camWidth = width / 2; camHeight = height / 2;
+        explicit ImageCollector(std::string &cns,
+                                std::vector<std::shared_ptr<Camera>> &cms,
+                                int32_t width, int32_t height):
+                                    cams(cns), cameras(cms), camFrames(),
+                                    camWidth(width/2), camHeight(height/2) {
+            log_d("ImageCollector[%s] created.", cams.c_str());
             for (auto& camFrame : camFrames) { camFrame.reset(); }
             std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
             if (camFrames.empty()) {
@@ -1985,91 +1967,92 @@ namespace x {
                     camFrames.push_back(std::make_shared<ImageFrame>(camWidth, camHeight));
                 }
             }
+        }
+
+        ~ImageCollector() {
+            for (auto& camera : cameras) { camera.reset(); }
+            for (auto& camFrame : camFrames) { camFrame.reset(); }
+            std::vector<std::shared_ptr<Camera>> ec; cameras.swap(ec);
+            std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
+            log_d("ImageCollector[%s] release.", cams.c_str());
+        }
+
+    public:
+        static void collectRunnable(const std::shared_ptr<ImageCollector>& collector,
+                                    const std::shared_ptr<std::atomic_bool>& runnable,
+                                    const CameraMerge merge) {
+            log_d("ImageCollector[%s] collect thread start.", collector->cams.c_str());
             int32_t fps = 0;
             if (merge == CameraMerge::Single) {
-                const auto &camera = cameras.front();
+                const auto &camera = collector->cameras.front();
                 if (!camera->previewing()) {
-                    camera->preview(camWidth, camHeight, &fps);
+                    camera->preview(collector->camWidth, collector->camHeight, &fps);
                 }
             } else {
-                for (const auto &camera : cameras) {
+                for (const auto &camera : collector->cameras) {
                     if (!camera->previewing()) {
-                        camera->preview(camWidth, camHeight, &fps);
+                        camera->preview(collector->camWidth, collector->camHeight, &fps);
                     }
                 }
             }
             fps = fps <= 0 ? 30 : fps;
             auto fps_ms = (int32_t)(1000.0f / fps);
-            CollectRunnable = true;
-            std::thread ct(ImageRecorder::collectRunnable, this, fps_ms, merge);
-            ct.detach();
-        }
-
-        void stop() {
-            CollectRunnable = false;
-            for (const auto& camera : cameras) {
-                if (camera->previewing()) camera->close();
-            }
-        }
-
-    private:
-        static void collectRunnable(ImageRecorder *recorder, int32_t fps_ms, CameraMerge merge) {
-            log_d("ImageRecorder[%s] collect thread start.", recorder->cams.c_str());
             long ms;
             struct timeval tv{};
-            while (CollectRunnable) {
+            while (*runnable) {
                 gettimeofday(&tv, nullptr);
                 ms = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-                collectCameras(recorder, merge);
+                collectCameras(collector, merge);
                 gettimeofday(&tv, nullptr);
                 ms = tv.tv_sec * 1000 + tv.tv_usec / 1000 - ms;
                 ms = fps_ms - ms;
                 if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
             }
-            log_d("ImageRecorder[%s] collect thread exit.", recorder->cams.c_str());
+            log_d("ImageCollector[%s] collect thread exit.", collector->cams.c_str());
         }
 
-        static void collectCameras(ImageRecorder *recorder, CameraMerge merge) {
+    private:
+        static void collectCameras(const std::shared_ptr<ImageCollector>& collector, CameraMerge merge) {
             if (merge == CameraMerge::Single) {
-                const auto &camera = recorder->cameras.front();
+                const auto &camera = collector->cameras.front();
                 if (camera->previewing()) {
-                    ImageFrame frame(recorder->camWidth, recorder->camHeight);
+                    ImageFrame frame(collector->camWidth, collector->camHeight);
                     if (camera->getLatestImage(frame)) {
-                        postImageFrame(frame);
+                        postRendererImageFrame(frame);
                     }
                 }
             } else {
-                int32_t n = recorder->cameras.size();
-                for (const auto &camera : recorder->cameras) {
+                int32_t n = collector->cameras.size();
+                for (const auto &camera : collector->cameras) {
                     if (!camera->previewing()) n--;
                 }
                 if (n == 1) {
-                    const auto &camera = recorder->cameras.front();
+                    const auto &camera = collector->cameras.front();
                     if (camera->previewing()) {
-                        ImageFrame frame(recorder->camWidth, recorder->camHeight);
+                        ImageFrame frame(collector->camWidth, collector->camHeight);
                         if (camera->getLatestImage(frame)) {
-                            postImageFrame(frame);
+                            postRendererImageFrame(frame);
                         }
                     }
-                } else if (recorder->cameras.size() > 1) {
-                    collectMerge(recorder, merge);
+                } else if (collector->cameras.size() > 1) {
+                    collectMerge(collector, merge);
                 }
             }
         }
 
-        static void collectMerge(ImageRecorder *recorder, CameraMerge merge) {
-            int32_t i = 0, n = recorder->cameras.size();
-            for (const auto &camera : recorder->cameras) {
+        static void collectMerge(const std::shared_ptr<ImageCollector>& collector, CameraMerge merge) {
+            int32_t i = 0, n = collector->cameras.size();
+            for (const auto &camera : collector->cameras) {
                 if (!camera->previewing()) n--;
             }
-            ImageFrame frame(recorder->camWidth, recorder->camHeight);
+            ImageFrame frame(collector->camWidth, collector->camHeight);
             auto *fData = frame.getData();
-            for (const auto &camera : recorder->cameras) {
+            for (const auto &camera : collector->cameras) {
                 if (camera->previewing()) {
-                    if (camera->getLatestImage(*recorder->camFrames[i])) {
-                        if (recorder->camFrames[i]->useMirror()) {
-                            auto *data = recorder->camFrames[i]->getData();
-                            cv::Mat ot(recorder->camHeight, recorder->camWidth, CV_8UC4, data);
+                    if (camera->getLatestImage(*collector->camFrames[i])) {
+                        if (collector->camFrames[i]->useMirror()) {
+                            auto *data = collector->camFrames[i]->getData();
+                            cv::Mat ot(collector->camHeight, collector->camWidth, CV_8UC4, data);
                             cv::flip(ot, ot, 1);
                         }
                     }
@@ -2080,32 +2063,88 @@ namespace x {
                 default:
                 case CameraMerge::Single:
                 case CameraMerge::Vertical: {
-                    auto iw = recorder->camWidth, ih = recorder->camHeight / n;
-                    auto ic = (recorder->camHeight - ih) / 2;
+                    auto iw = collector->camWidth, ih = collector->camHeight / n;
+                    auto ic = (collector->camHeight - ih) / 2;
                     for (i = 0; i < n; i++) {
-                        auto *data = recorder->camFrames[i]->getData();
+                        auto *data = collector->camFrames[i]->getData();
                         memcpy(fData + i * iw * ih, data + iw * ic, sizeof(uint32_t) * iw * ih);
                     }
                 } break;
                 case CameraMerge::Chat: {
-                    auto iw = recorder->camWidth, ih = recorder->camHeight / (n - 1);
-                    auto ic = (recorder->camHeight - ih) / 2;
+                    auto iw = collector->camWidth, ih = collector->camHeight / (n - 1);
+                    auto ic = (collector->camHeight - ih) / 2;
                     for (i = 0; i < (n - 1); i++) {
-                        auto *data = recorder->camFrames[i]->getData();
+                        auto *data = collector->camFrames[i]->getData();
                         memcpy(fData + i * iw * ih, data + iw * ic, sizeof(uint32_t) * iw * ih);
                     }
-                    auto *data = recorder->camFrames[n - 1]->getData();
-                    cv::Mat rt(recorder->camHeight, recorder->camWidth, CV_8UC4, data);
-                    auto dw = (int32_t)(recorder->camWidth  * 0.25f);
-                    auto dh = (int32_t)(recorder->camHeight * 0.25f);
+                    auto *data = collector->camFrames[n - 1]->getData();
+                    cv::Mat rt(collector->camHeight, collector->camWidth, CV_8UC4, data);
+                    auto dw = (int32_t)(collector->camWidth  * 0.25f);
+                    auto dh = (int32_t)(collector->camHeight * 0.25f);
                     cv::Mat dt(dh, dw, CV_8UC4);
                     cv::resize(rt, dt, cv::Size(dw, dh));
-                    cv::Mat ft(recorder->camHeight, recorder->camWidth, CV_8UC4, fData);
+                    cv::Mat ft(collector->camHeight, collector->camWidth, CV_8UC4, fData);
                     cv::Mat roi = ft(cv::Rect(ft.cols - dt.cols - 30, 50, dt.cols, dt.rows));
                     dt.copyTo(roi);
                 } break;
             }
-            postImageFrame(frame);
+            postRendererImageFrame(frame);
+        }
+
+    private:
+        ImageCollector(ImageCollector&&) = delete;
+        ImageCollector(const ImageCollector&) = delete;
+        ImageCollector& operator=(ImageCollector&&) = delete;
+        ImageCollector& operator=(const ImageCollector&) = delete;
+
+    private:
+        std::string                              cams;
+        std::vector<std::shared_ptr<Camera>>     cameras;
+        std::vector<std::shared_ptr<ImageFrame>> camFrames;
+        int32_t                                  camWidth;
+        int32_t                                  camHeight;
+    };
+
+
+    /*
+     *
+     */
+    class ImageRecorder {
+    public:
+        explicit ImageRecorder(const std::string &&cms): cams(cms),
+                                                         collectRunnable(std::make_shared<std::atomic_bool>(false)),
+                                                         collector() {
+            log_d("ImageRecorder[%s] created.", cams.c_str());
+            std::regex re{ "," };
+            std::vector<std::string> ids {
+                    std::sregex_token_iterator(cams.begin(), cams.end(), re, -1),
+                    std::sregex_token_iterator()};
+            Camera::enumerate(cameras, ids);
+        }
+
+        ~ImageRecorder() {
+            *collectRunnable = false;
+            collectRunnable.reset();
+            for (auto& camera : cameras) { camera->close();camera.reset(); }
+            std::vector<std::shared_ptr<Camera>> ec; cameras.swap(ec);
+            log_d("ImageRecorder[%s] release.", cams.c_str());
+        }
+
+    public:
+        void start(int32_t width, int32_t height, CameraMerge merge) {
+            if (*collectRunnable) return;
+            collectRunnable = std::make_shared<std::atomic_bool>(true);
+            collector = std::make_shared<ImageCollector>(cams, cameras, width, height);
+            std::thread ct(ImageCollector::collectRunnable, collector, collectRunnable, merge);
+            ct.detach();
+        }
+
+        void stop() {
+            *collectRunnable = false;
+            collectRunnable = std::make_shared<std::atomic_bool>(false);
+            for (const auto& camera : cameras) {
+                if (camera->previewing()) camera->close();
+            }
         }
 
     private:
@@ -2117,9 +2156,8 @@ namespace x {
     private:
         std::string                              cams;
         std::vector<std::shared_ptr<Camera>>     cameras;
-        std::vector<std::shared_ptr<ImageFrame>> camFrames;
-        int32_t                                  camWidth;
-        int32_t                                  camHeight;
+        std::shared_ptr<std::atomic_bool>        collectRunnable;
+        std::shared_ptr<ImageCollector>          collector;
     };
 
 
@@ -2160,6 +2198,116 @@ namespace x {
     private:
         std::shared_ptr<Audio> audio;
     };
+
+
+    /*
+     *
+     */
+    class EncodeWorker {
+    public:
+        EncodeWorker(std::shared_ptr<ImageQueue> &iQ,
+                     std::shared_ptr<AudioQueue> &aQ): imgQ(iQ), audQ(aQ) {
+            log_d("EncodeWorker created.");
+        }
+
+        ~EncodeWorker() {
+            log_d("EncodeWorker release.");
+        }
+
+    public:
+        static void encodeRunnable(EncodeWorker *worker,
+                                   const std::shared_ptr<std::atomic_bool>& runnable) {
+            log_d("EncodeWorker encode thread start.");
+            while(*runnable) {
+                bool ok = false;
+                ImageFrame img;
+                worker->imgQ->try_dequeue(img);
+                ok |= encodeImageFrame(worker, std::move(img));
+                AudioFrame aud;
+                worker->audQ->try_dequeue(aud);
+                ok |= encodeAudioFrame(worker, std::move(aud));
+                if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            log_d("EncodeWorker encode thread exit.");
+            delete worker;
+        }
+
+    private:
+        static bool encodeImageFrame(EncodeWorker *worker, ImageFrame &&frame) {
+            if (frame.available()) {
+                // TODO: DEBUG
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        static bool encodeAudioFrame(EncodeWorker *worker, AudioFrame &&frame) {
+            if (frame.available()) {
+                // TODO: DEBUG
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+    private:
+        EncodeWorker(EncodeWorker&&) = delete;
+        EncodeWorker(const EncodeWorker&) = delete;
+        EncodeWorker& operator=(EncodeWorker&&) = delete;
+        EncodeWorker& operator=(const EncodeWorker&) = delete;
+
+    private:
+        std::shared_ptr<ImageQueue> imgQ;
+        std::shared_ptr<AudioQueue> audQ;
+    };
+
+
+    /*
+     *
+     */
+    class VideoEncoder {
+    public:
+        VideoEncoder(): imgQ(std::make_shared<ImageQueue>()),
+                        audQ(std::make_shared<AudioQueue>()),
+                        encodeRunnable(std::make_shared<std::atomic_bool>(true)) {
+            log_d("VideoEncoder created.");
+            std::thread et(EncodeWorker::encodeRunnable, new EncodeWorker(imgQ, audQ), encodeRunnable);
+            et.detach();
+        }
+
+        ~VideoEncoder() {
+            *encodeRunnable = false;
+            encodeRunnable.reset();
+            log_d("VideoEncoder release.");
+        }
+
+    public:
+        void appendImageFrame(ImageFrame &&frm) {
+            if (frm.available()) {
+                imgQ->enqueue(std::forward<ImageFrame>(frm));
+            }
+        }
+
+        void appendAudioFrame(AudioFrame &&frm) {
+            if (frm.available()) {
+                audQ->enqueue(std::forward<AudioFrame>(frm));
+            }
+        }
+
+    private:
+        VideoEncoder(VideoEncoder&&) = delete;
+        VideoEncoder(const VideoEncoder&) = delete;
+        VideoEncoder& operator=(VideoEncoder&&) = delete;
+        VideoEncoder& operator=(const VideoEncoder&) = delete;
+
+    private:
+        std::shared_ptr<ImageQueue>       imgQ;
+        std::shared_ptr<AudioQueue>       audQ;
+        std::shared_ptr<std::atomic_bool> encodeRunnable;
+    };
 } // namespace x
 
 
@@ -2175,6 +2323,7 @@ static JavaVM           *g_JavaVM         = nullptr;
 static x::ImageRenderer *g_Renderer       = nullptr;
 static x::ImageRecorder *g_ImageRecorder  = nullptr;
 static x::AudioRecorder *g_AudioRecorder  = nullptr;
+static x::VideoEncoder  *g_Encoder        = nullptr;
 static x::CameraMerge    g_CamMerge       = x::CameraMerge::Single;
 
 static void requestGlRender(void *ctx = nullptr) {
@@ -2213,10 +2362,22 @@ static void postGlRender(long delayMillis = 0, void* ctx= nullptr) {
     }
 }
 
-static void x::postImageFrame(x::ImageFrame &frame) {
+static void x::postRendererImageFrame(x::ImageFrame &frame) {
     if (g_Renderer != nullptr) {
         g_Renderer->appendFrame(std::forward<x::ImageFrame>(frame));
         requestGlRender();
+    }
+}
+
+static void x::postEncoderImageFrame(x::ImageFrame &frame) {
+    if (g_Encoder != nullptr) {
+        g_Encoder->appendImageFrame(std::forward<x::ImageFrame>(frame));
+    }
+}
+
+static void x::postEncoderAudioFrame(x::AudioFrame &frame) {
+    if (g_Encoder != nullptr) {
+        g_Encoder->appendAudioFrame(std::forward<x::AudioFrame>(frame));
     }
 }
 
@@ -2242,6 +2403,7 @@ jstring fileRootPath) {
     x::FileRoot = new std::string(file);
     env->ReleaseStringUTFChars(fileRootPath, file);
     x::EffectName = new std::string("NONE");
+    g_Encoder = new x::VideoEncoder();
     g_Renderer = new x::ImageRenderer(*x::EffectName);
     g_CamMerge  = x::CameraMerge::Single;
     return 0;
@@ -2282,6 +2444,8 @@ JNIEnv *env, jobject thiz) {
     g_AudioRecorder = nullptr;
     delete g_Renderer;
     g_Renderer = nullptr;
+    delete g_Encoder;
+    g_Encoder = nullptr;
     log_d("JNI release.");
     return 0;
 }
