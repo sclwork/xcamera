@@ -80,6 +80,7 @@ public class MainActivity extends AppCompatActivity {
             noPermission.setVisibility(hasPermission?View.GONE:View.VISIBLE);
         }
         Button camera = findViewById(R.id.camera);
+        Button record = findViewById(R.id.record);
         Button effect = findViewById(R.id.effect);
         Button merge = findViewById(R.id.merge);
         if (hasPermission) {
@@ -88,6 +89,11 @@ public class MainActivity extends AppCompatActivity {
                 if (cs == C01) cs = C10;
                 else if (cs == C10) cs = C01;
                 CameraManager.preview(camMerge, cs);
+            });
+            if (record != null) record.setVisibility(View.VISIBLE);
+            if (record != null) record.setOnClickListener(v -> {
+                if (CameraManager.recording()) CameraManager.stopRecord();
+                else CameraManager.startRecord(getFilesDir() + "/demo.mp4");
             });
             if (effect != null) effect.setVisibility(View.VISIBLE);
             if (effect != null) effect.setOnClickListener(v -> {
@@ -119,6 +125,7 @@ public class MainActivity extends AppCompatActivity {
             });
         } else {
             if (camera != null) camera.setVisibility(View.GONE);
+            if (record != null) record.setVisibility(View.GONE);
             if (effect != null) effect.setVisibility(View.GONE);
             if (merge != null) merge.setVisibility(View.GONE);
         }

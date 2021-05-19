@@ -407,8 +407,8 @@ namespace x {
      *
      */
     static void postRendererImageFrame(ImageFrame &frame);
-    static void postEncoderImageFrame(ImageFrame &frame);
-    static void postEncoderAudioFrame(AudioFrame &frame);
+    static void postEncoderImageFrame(ImageFrame &&frame);
+    static void postEncoderAudioFrame(AudioFrame &&frame);
 
 
     /*
@@ -870,7 +870,11 @@ namespace x {
      */
     class ImageRenderer {
     public:
-        ImageRenderer(std::string &e_name): width(0), height(0), drawQ() {
+        ImageRenderer(std::string &e_name,
+                      bool (*recording)(),
+                      void (*completed)(ImageFrame &&)):
+                        width(0), height(0), drawQ(),
+                        checkRecording(recording), frameCompleted(completed) {
             log_d("ImageRenderer created.");
             paint = new ImagePaint(std::forward<std::string>(e_name));
         }
@@ -933,7 +937,13 @@ namespace x {
             ImageFrame nf;
             drawQ.try_dequeue(nf);
             if (paint != nullptr) {
-                paint->draw(nf);
+                if (checkRecording != nullptr && checkRecording() && frameCompleted != nullptr) {
+                    ImageFrame of;
+                    paint->draw(nf, &of);
+                    frameCompleted(std::move(of));
+                } else {
+                    paint->draw(nf);
+                }
             }
         }
 
@@ -965,6 +975,10 @@ namespace x {
         int32_t     height;
         ImagePaint *paint;
         ImageQueue  drawQ;
+
+    private:
+        bool (*checkRecording)();
+        void (*frameCompleted)(ImageFrame &&);
     };
 
 
@@ -2142,9 +2156,8 @@ namespace x {
         void stop() {
             *collectRunnable = false;
             collectRunnable = std::make_shared<std::atomic_bool>(false);
-            for (const auto& camera : cameras) {
-                if (camera->previewing()) camera->close();
-            }
+            for (const auto& camera : cameras) { if (camera->previewing()) camera->close(); }
+            collector.reset();
         }
 
     private:
@@ -2166,7 +2179,10 @@ namespace x {
      */
     class AudioRecorder {
     public:
-        AudioRecorder(): audio(std::make_shared<Audio>()) {
+        AudioRecorder(bool (*recording)(),
+                      void (*completed)(AudioFrame &&)):
+                        audio(std::make_shared<Audio>()),
+                        checkRecording(recording), frameCompleted(completed) {
             log_d("AudioRecorder created.");
         }
 
@@ -2187,6 +2203,15 @@ namespace x {
 
     private:
         static void collectAudio(void *ctx) {
+            auto *recorder = (AudioRecorder*)ctx;
+            if (recorder->checkRecording != nullptr &&
+                recorder->checkRecording() &&
+                recorder->frameCompleted != nullptr) {
+                AudioFrame frame;
+                if (recorder->audio->collectFrame(frame)) {
+                    recorder->frameCompleted(std::move(frame));
+                }
+            }
         }
 
     private:
@@ -2197,6 +2222,10 @@ namespace x {
 
     private:
         std::shared_ptr<Audio> audio;
+
+    private:
+        bool (*checkRecording)();
+        void (*frameCompleted)(AudioFrame &&);
     };
 
 
@@ -2206,7 +2235,7 @@ namespace x {
     class EncodeWorker {
     public:
         EncodeWorker(std::shared_ptr<ImageQueue> &iQ,
-                     std::shared_ptr<AudioQueue> &aQ): imgQ(iQ), audQ(aQ) {
+                     std::shared_ptr<AudioQueue> &aQ): name(), imgQ(iQ), audQ(aQ) {
             log_d("EncodeWorker created.");
         }
 
@@ -2215,7 +2244,13 @@ namespace x {
         }
 
     public:
-        static void encodeRunnable(EncodeWorker *worker,
+        void updateFileName(std::string &&nme) {
+            name = nme;
+            log_d("EncodeWorker update file name: %s.", name.c_str());
+        }
+
+    public:
+        static void encodeRunnable(const std::shared_ptr<EncodeWorker>& worker,
                                    const std::shared_ptr<std::atomic_bool>& runnable) {
             log_d("EncodeWorker encode thread start.");
             while(*runnable) {
@@ -2229,11 +2264,10 @@ namespace x {
                 if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             log_d("EncodeWorker encode thread exit.");
-            delete worker;
         }
 
     private:
-        static bool encodeImageFrame(EncodeWorker *worker, ImageFrame &&frame) {
+        static bool encodeImageFrame(const std::shared_ptr<EncodeWorker>& worker, ImageFrame &&frame) {
             if (frame.available()) {
                 // TODO: DEBUG
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2243,7 +2277,7 @@ namespace x {
             }
         }
 
-        static bool encodeAudioFrame(EncodeWorker *worker, AudioFrame &&frame) {
+        static bool encodeAudioFrame(const std::shared_ptr<EncodeWorker>& worker, AudioFrame &&frame) {
             if (frame.available()) {
                 // TODO: DEBUG
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2260,6 +2294,7 @@ namespace x {
         EncodeWorker& operator=(const EncodeWorker&) = delete;
 
     private:
+        std::string                 name;
         std::shared_ptr<ImageQueue> imgQ;
         std::shared_ptr<AudioQueue> audQ;
     };
@@ -2274,7 +2309,8 @@ namespace x {
                         audQ(std::make_shared<AudioQueue>()),
                         encodeRunnable(std::make_shared<std::atomic_bool>(true)) {
             log_d("VideoEncoder created.");
-            std::thread et(EncodeWorker::encodeRunnable, new EncodeWorker(imgQ, audQ), encodeRunnable);
+            worker = std::make_shared<EncodeWorker>(imgQ, audQ);
+            std::thread et(EncodeWorker::encodeRunnable, worker, encodeRunnable);
             et.detach();
         }
 
@@ -2282,6 +2318,13 @@ namespace x {
             *encodeRunnable = false;
             encodeRunnable.reset();
             log_d("VideoEncoder release.");
+        }
+
+    public:
+        void updateFileName(std::string &&name) {
+            if (worker != nullptr) {
+                worker->updateFileName(std::forward<std::string>(name));
+            }
         }
 
     public:
@@ -2307,6 +2350,7 @@ namespace x {
         std::shared_ptr<ImageQueue>       imgQ;
         std::shared_ptr<AudioQueue>       audQ;
         std::shared_ptr<std::atomic_bool> encodeRunnable;
+        std::shared_ptr<EncodeWorker>     worker;
     };
 } // namespace x
 
@@ -2318,14 +2362,33 @@ namespace x {
 extern "C" {
 #endif
 
-static jobject           g_MainClass      = nullptr;
-static JavaVM           *g_JavaVM         = nullptr;
-static x::ImageRenderer *g_Renderer       = nullptr;
-static x::ImageRecorder *g_ImageRecorder  = nullptr;
-static x::AudioRecorder *g_AudioRecorder  = nullptr;
-static x::VideoEncoder  *g_Encoder        = nullptr;
-static x::CameraMerge    g_CamMerge       = x::CameraMerge::Single;
 
+/*
+ *
+ */
+static jobject g_MainClass = nullptr;
+static JavaVM *g_JavaVM    = nullptr;
+
+
+/*
+ *
+ */
+static x::ImageRenderer *g_Renderer      = nullptr;
+static x::ImageRecorder *g_ImageRecorder = nullptr;
+static x::AudioRecorder *g_AudioRecorder = nullptr;
+static x::VideoEncoder  *g_Encoder       = nullptr;
+static x::CameraMerge    g_CamMerge      = x::CameraMerge::Single;
+
+
+/*
+ *
+ */
+static std::atomic_bool  g_Recording;
+
+
+/*
+ *
+ */
 static void requestGlRender(void *ctx = nullptr) {
     if (g_JavaVM == nullptr || g_MainClass == nullptr) {
         return;
@@ -2362,6 +2425,14 @@ static void postGlRender(long delayMillis = 0, void* ctx= nullptr) {
     }
 }
 
+
+/*
+ *
+ */
+static bool checkVideoRecording() {
+    return g_Recording;
+}
+
 static void x::postRendererImageFrame(x::ImageFrame &frame) {
     if (g_Renderer != nullptr) {
         g_Renderer->appendFrame(std::forward<x::ImageFrame>(frame));
@@ -2369,18 +2440,22 @@ static void x::postRendererImageFrame(x::ImageFrame &frame) {
     }
 }
 
-static void x::postEncoderImageFrame(x::ImageFrame &frame) {
+static void x::postEncoderImageFrame(x::ImageFrame &&frame) {
     if (g_Encoder != nullptr) {
         g_Encoder->appendImageFrame(std::forward<x::ImageFrame>(frame));
     }
 }
 
-static void x::postEncoderAudioFrame(x::AudioFrame &frame) {
+static void x::postEncoderAudioFrame(x::AudioFrame &&frame) {
     if (g_Encoder != nullptr) {
         g_Encoder->appendAudioFrame(std::forward<x::AudioFrame>(frame));
     }
 }
 
+
+/*
+ *
+ */
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_JavaVM = vm;
     return JNI_VERSION_1_6;
@@ -2395,6 +2470,7 @@ Java_com_scliang_x_camera_CameraManager_jniInit(
 JNIEnv *env, jobject thiz,
 jstring fileRootPath) {
     log_d("JNI init.");
+    g_Recording = false;
     jclass mainClass = env->FindClass("com/scliang/x/camera/CameraManager");
     if (mainClass != nullptr) {
         g_MainClass = env->NewGlobalRef(mainClass);
@@ -2404,7 +2480,7 @@ jstring fileRootPath) {
     env->ReleaseStringUTFChars(fileRootPath, file);
     x::EffectName = new std::string("NONE");
     g_Encoder = new x::VideoEncoder();
-    g_Renderer = new x::ImageRenderer(*x::EffectName);
+    g_Renderer = new x::ImageRenderer(*x::EffectName, checkVideoRecording, x::postEncoderImageFrame);
     g_CamMerge  = x::CameraMerge::Single;
     return 0;
 }
@@ -2430,6 +2506,7 @@ JNIEnv *env, jobject thiz) {
 JNIEXPORT jint JNICALL
 Java_com_scliang_x_camera_CameraManager_jniRelease(
 JNIEnv *env, jobject thiz) {
+    g_Recording = false;
     if (g_MainClass != nullptr) {
         env->DeleteGlobalRef(g_MainClass);
     }
@@ -2507,12 +2584,40 @@ jstring cameras, jint merge) {
     const char *cams = env->GetStringUTFChars(cameras, nullptr);
     g_ImageRecorder = new x::ImageRecorder(std::string(cams));
     g_CamMerge = (x::CameraMerge)merge;
-    if (g_AudioRecorder == nullptr) g_AudioRecorder = new x::AudioRecorder();
+    if (g_AudioRecorder == nullptr) {
+        g_AudioRecorder = new x::AudioRecorder(checkVideoRecording, x::postEncoderAudioFrame);
+    }
     if (g_Renderer != nullptr && g_Renderer->getWidth() > 0 && g_Renderer->getHeight() > 0) {
         g_ImageRecorder->start(g_Renderer->getWidth(), g_Renderer->getHeight(), g_CamMerge);
         g_AudioRecorder->start();
     }
     env->ReleaseStringUTFChars(cameras, cams);
+    return 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_scliang_x_camera_CameraManager_jniRecording(
+JNIEnv *env, jobject thiz) {
+    return g_Recording;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_scliang_x_camera_CameraManager_jniRecordStart(
+JNIEnv *env, jobject thiz,
+jstring name) {
+    const char *nme = env->GetStringUTFChars(name, nullptr);
+    if (g_Encoder != nullptr) {
+        g_Encoder->updateFileName(std::string(nme));
+        g_Recording = true;
+    }
+    env->ReleaseStringUTFChars(name, nme);
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_scliang_x_camera_CameraManager_jniRecordStop(
+JNIEnv *env, jobject thiz) {
+    g_Recording = false;
     return 0;
 }
 

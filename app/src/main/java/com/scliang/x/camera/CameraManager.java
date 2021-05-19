@@ -98,6 +98,29 @@ public class CameraManager {
     /*
      *
      */
+    public static boolean recording() {
+        CameraManager m = SingletonHolder.INSTANCE;
+        return m.jniRecording();
+    }
+
+    public static void startRecord(@NonNull String name) {
+        CameraManager m = SingletonHolder.INSTANCE;
+        if (GlView != null && GlView.get() != null) {
+            GlView.get().queueEvent(()->m.jniRecordStart(name));
+        }
+    }
+
+    public static void stopRecord() {
+        CameraManager m = SingletonHolder.INSTANCE;
+        if (GlView != null && GlView.get() != null) {
+            GlView.get().queueEvent(m::jniRecordStop);
+        }
+    }
+
+
+    /*
+     *
+     */
     private void initGlslResource(Context context) {
         effectNames.clear();
         setupGlslFiles(context);
@@ -327,6 +350,12 @@ public class CameraManager {
     private native int jniUpdatePaint(@NonNull String name);
     private native int jniDrawFrame();
     private native int jniPreview(@NonNull String cameras, int merge);
+    /*
+     *
+     */
+    private native boolean jniRecording();
+    private native int     jniRecordStart(@NonNull String name);
+    private native int     jniRecordStop();
     /*
      *
      */

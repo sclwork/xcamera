@@ -38,12 +38,26 @@
         android:text="SWITCH" />
 
     <Button
+        android:id="@+id/record"
+        android:layout_width="100dp"
+        android:layout_height="40dp"
+        android:layout_alignParentRight="true"
+        android:layout_alignParentBottom="true"
+        android:layout_marginBottom="60dp"
+        android:background="?android:attr/selectableItemBackground"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="#ffffffff"
+        android:text="RECORD" />
+
+    <Button
         android:id="@+id/effect"
         android:layout_width="match_parent"
         android:layout_height="40dp"
         android:layout_centerHorizontal="true"
         android:layout_alignParentBottom="true"
         android:layout_marginBottom="60dp"
+        android:layout_toLeftOf="@id/record"
         android:layout_toRightOf="@id/camera"
         android:background="?android:attr/selectableItemBackground"
         android:textSize="15sp"
