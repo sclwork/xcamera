@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <regex>
+#include <map>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -2232,28 +2233,39 @@ namespace x {
     /*
      *
      */
+    class VideoEncoder;
     class EncodeWorker {
     public:
-        EncodeWorker(std::shared_ptr<ImageQueue> &iQ,
-                     std::shared_ptr<AudioQueue> &aQ): name(), imgQ(iQ), audQ(aQ) {
-            log_d("EncodeWorker created.");
+        EncodeWorker(int32_t i,
+                     std::shared_ptr<ImageQueue> &iQ,
+                     std::shared_ptr<AudioQueue> &aQ,
+                     void (*callback)(VideoEncoder&, int32_t),
+                     VideoEncoder &en):
+                        id(i), imgQ(iQ), audQ(aQ), exited(false),
+                        completeCallback(callback), encoder(en) {
+            struct timeval tv{};
+            gettimeofday(&tv, nullptr);
+            _time = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            log_d("EncodeWorker[%d@%ld] created.", id, _time);
         }
 
         ~EncodeWorker() {
-            log_d("EncodeWorker release.");
+            log_d("EncodeWorker[%d@%ld] release.", id, _time);
         }
 
     public:
-        void updateFileName(std::string &&nme) {
-            name = nme;
-            log_d("EncodeWorker update file name: %s.", name.c_str());
+        void exit() {
+            exited = true;
         }
 
     public:
         static void encodeRunnable(const std::shared_ptr<EncodeWorker>& worker,
                                    const std::shared_ptr<std::atomic_bool>& runnable) {
-            log_d("EncodeWorker encode thread start.");
-            while(*runnable) {
+            log_d("EncodeWorker[%d@%ld] encode thread start.", worker->id, worker->_time);
+            while(*runnable || worker->imgQ->size_approx() > 0 || worker->audQ->size_approx() > 0) {
+                if (worker->exited) {
+                    break;
+                }
                 bool ok = false;
                 ImageFrame img;
                 worker->imgQ->try_dequeue(img);
@@ -2263,14 +2275,15 @@ namespace x {
                 ok |= encodeAudioFrame(worker, std::move(aud));
                 if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            log_d("EncodeWorker encode thread exit.");
+            log_d("EncodeWorker[%d@%ld] encode thread exit.", worker->id, worker->_time);
+            if (!worker->exited)worker->completeCallback(worker->encoder, worker->id);
         }
 
     private:
         static bool encodeImageFrame(const std::shared_ptr<EncodeWorker>& worker, ImageFrame &&frame) {
             if (frame.available()) {
                 // TODO: DEBUG
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 return true;
             } else {
                 return false;
@@ -2294,9 +2307,17 @@ namespace x {
         EncodeWorker& operator=(const EncodeWorker&) = delete;
 
     private:
-        std::string                 name;
+        long _time;
+
+    private:
+        int32_t                     id;
         std::shared_ptr<ImageQueue> imgQ;
         std::shared_ptr<AudioQueue> audQ;
+        std::atomic_bool            exited;
+
+    private:
+        void (*completeCallback)(VideoEncoder&, int32_t);
+        VideoEncoder &encoder;
     };
 
 
@@ -2305,26 +2326,17 @@ namespace x {
      */
     class VideoEncoder {
     public:
-        VideoEncoder(): imgQ(std::make_shared<ImageQueue>()),
+        VideoEncoder(): name(),
+                        imgQ(std::make_shared<ImageQueue>()),
                         audQ(std::make_shared<AudioQueue>()),
-                        encodeRunnable(std::make_shared<std::atomic_bool>(true)) {
+                        encodeRunnable(std::make_shared<std::atomic_bool>(false)),
+                        workers() {
             log_d("VideoEncoder created.");
-            worker = std::make_shared<EncodeWorker>(imgQ, audQ);
-            std::thread et(EncodeWorker::encodeRunnable, worker, encodeRunnable);
-            et.detach();
         }
 
         ~VideoEncoder() {
-            *encodeRunnable = false;
-            encodeRunnable.reset();
+            release();
             log_d("VideoEncoder release.");
-        }
-
-    public:
-        void updateFileName(std::string &&name) {
-            if (worker != nullptr) {
-                worker->updateFileName(std::forward<std::string>(name));
-            }
         }
 
     public:
@@ -2340,6 +2352,65 @@ namespace x {
             }
         }
 
+    public:
+        void start(std::string &&nme) {
+            if (*encodeRunnable) {
+                log_e("VideoEncoder running - %s.", name.c_str());
+                return;
+            }
+            name = nme;
+            clearImageQ(); clearAudioQ();
+            for (auto& worker : workers) { worker.second->exit();worker.second.reset(); }
+            workers.clear();
+            log_d("VideoEncoder started: %s.", name.c_str());
+            encodeRunnable = std::make_shared<std::atomic_bool>(true);
+            int32_t id = workers.size();
+            workers[id] = std::make_shared<EncodeWorker>(id, imgQ, audQ,
+                                                         VideoEncoder::onEncodeWorkerCompleted,
+                                                         *this);
+            for (const auto& worker : workers) {
+                std::thread et(EncodeWorker::encodeRunnable, worker.second, encodeRunnable);
+                et.detach();
+            }
+        }
+
+        void stop() {
+            if (!*encodeRunnable) return;
+            log_d("VideoEncoder request stop: %s.", name.c_str());
+            *encodeRunnable = false;
+            encodeRunnable = std::make_shared<std::atomic_bool>(false);
+        }
+
+    private:
+        void completed() {
+            log_d("VideoEncoder stopped: %s.", name.c_str());
+        }
+
+    private:
+        static void onEncodeWorkerCompleted(VideoEncoder &encoder, int32_t id) {
+            encoder.workers.erase(id);
+            if (encoder.workers.empty()) { encoder.completed(); }
+        }
+
+    private:
+        void clearImageQ() {
+            ImageFrame f;
+            while (imgQ->try_dequeue(f));
+        }
+
+        void clearAudioQ() {
+            AudioFrame f;
+            while (audQ->try_dequeue(f));
+        }
+
+        void release() {
+            *encodeRunnable = false;
+            encodeRunnable = std::make_shared<std::atomic_bool>(false);
+            clearImageQ(); clearAudioQ();
+            for (auto& worker : workers) { worker.second->exit();worker.second.reset(); }
+            workers.clear();
+        }
+
     private:
         VideoEncoder(VideoEncoder&&) = delete;
         VideoEncoder(const VideoEncoder&) = delete;
@@ -2347,10 +2418,11 @@ namespace x {
         VideoEncoder& operator=(const VideoEncoder&) = delete;
 
     private:
-        std::shared_ptr<ImageQueue>       imgQ;
-        std::shared_ptr<AudioQueue>       audQ;
-        std::shared_ptr<std::atomic_bool> encodeRunnable;
-        std::shared_ptr<EncodeWorker>     worker;
+        std::string                                      name;
+        std::shared_ptr<ImageQueue>                      imgQ;
+        std::shared_ptr<AudioQueue>                      audQ;
+        std::shared_ptr<std::atomic_bool>                encodeRunnable;
+        std::map<int32_t, std::shared_ptr<EncodeWorker>> workers;
     };
 } // namespace x
 
@@ -2607,7 +2679,7 @@ JNIEnv *env, jobject thiz,
 jstring name) {
     const char *nme = env->GetStringUTFChars(name, nullptr);
     if (g_Encoder != nullptr) {
-        g_Encoder->updateFileName(std::string(nme));
+        g_Encoder->start(std::string(nme));
         g_Recording = true;
     }
     env->ReleaseStringUTFChars(name, nme);
@@ -2618,6 +2690,9 @@ JNIEXPORT jint JNICALL
 Java_com_scliang_x_camera_CameraManager_jniRecordStop(
 JNIEnv *env, jobject thiz) {
     g_Recording = false;
+    if (g_Encoder != nullptr) {
+        g_Encoder->stop();
+    }
     return 0;
 }
 
