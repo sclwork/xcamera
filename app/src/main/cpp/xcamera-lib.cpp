@@ -1007,10 +1007,11 @@ namespace x {
      */
     class Camera {
     public:
-        Camera(std::string &&_id, int32_t fps): yuv_args(), id(_id), state(CameraState::None), dev(nullptr),
+        Camera(std::string &&_id, int32_t fps): yuv_args(), id(_id), state(CameraState::None),
                                                 width(0), height(0), fps_req(fps), fps_range(), iso_range(), ori(0),
-                                                awbs(), af_mode(ACAMERA_CONTROL_AF_MODE_OFF),
-                                                reader(nullptr), window(nullptr), cap_request(nullptr), out_container(nullptr),
+                                                awbs(), awb(ACAMERA_CONTROL_AWB_MODE_AUTO), af_mode(ACAMERA_CONTROL_AF_MODE_OFF),
+                                                mgr(ACameraManager_create()), dev(nullptr), reader(nullptr), window(nullptr),
+                                                cap_request(nullptr), out_container(nullptr),
                                                 out_session(nullptr), cap_session(nullptr), out_target(nullptr),
                                                 ds_callbacks({nullptr, onDisconnected, onError}),
                                                 css_callbacks({nullptr, onClosed, onReady, onActive}) {
@@ -1020,6 +1021,7 @@ namespace x {
 
         ~Camera() {
             close();
+            ACameraManager_delete(mgr);
             log_d("Camera[%s] release.", id.c_str());
         }
 
@@ -1167,18 +1169,12 @@ namespace x {
          * @return true: start preview success
          */
         bool preview(int32_t req_w, int32_t req_h, int32_t *out_fps) {
-            if (dev || state == CameraState::Previewing) {
+            if (state == CameraState::Previewing) {
                 log_e("Camera[%s] device is running.", id.c_str());
                 return false;
             }
 
             if (id.empty()) {
-                release();
-                return false;
-            }
-
-            ACameraManager *mgr = ACameraManager_create();
-            if (mgr == nullptr) {
                 release();
                 return false;
             }
@@ -1189,149 +1185,14 @@ namespace x {
             s = ACameraManager_getCameraCharacteristics(mgr, id.c_str(), &metadata);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to get camera meta data.", id.c_str());
-                ACameraManager_delete(mgr);
                 return false;
             }
 
             getSize(metadata, req_w, req_h, &width, &height);
             ACameraMetadata_free(metadata);
 
-            if (width <= 0 || height <= 0) {
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-            if (reader) {
-                AImageReader_setImageListener(reader, nullptr);
-                AImageReader_delete(reader);
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-            ms = AImageReader_new(width, height,
-                                  AIMAGE_FORMAT_YUV_420_888, 2, &reader);
-            if (ms != AMEDIA_OK) {
-                log_e("Camera[%s] Failed to new image reader.", id.c_str());
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-            if (window) {
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-            ms = AImageReader_getWindow(reader, &window);
-            if (ms != AMEDIA_OK) {
-                log_e("Camera[%s] Failed to get native window.", id.c_str());
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-            ANativeWindow_acquire(window);
-            s = ACameraManager_openCamera(mgr, id.c_str(), &ds_callbacks, &dev);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed[%d] to open camera device.", id.c_str(), s);
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-            s = ACameraDevice_createCaptureRequest(dev, TEMPLATE_RECORD, &cap_request);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to create capture request.", id.c_str());
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-//            log_d("Camera[%s] Success to create capture request.", id.c_str());
-            s = ACaptureSessionOutputContainer_create(&out_container);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to create session output container.", id.c_str());
-                ACameraManager_delete(mgr);
-                release();
-                return false;
-            }
-
-            // delete / release
-            ACameraManager_delete(mgr);
-//            log_d("Camera[%s] Success to open camera device.", id.c_str());
-
-            s = ACameraOutputTarget_create(window, &out_target);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to create CameraOutputTarget.", id.c_str());
-                release();
-                return false;
-            }
-
-            s = ACaptureRequest_addTarget(cap_request, out_target);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to add CameraOutputTarget.", id.c_str());
-                release();
-                return false;
-            }
-
-            s = ACaptureSessionOutput_create(window, &out_session);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to create CaptureSessionOutput.", id.c_str());
-                release();
-                return false;
-            }
-
-            s = ACaptureSessionOutputContainer_add(out_container, out_session);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to add CaptureSessionOutput.", id.c_str());
-                release();
-                return false;
-            }
-
-            s = ACameraDevice_createCaptureSession(dev, out_container, &css_callbacks, &cap_session);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed[%d] to create CaptureSession.", id.c_str(), s);
-                release();
-                return false;
-            }
-
-            s = ACaptureRequest_setEntry_u8(cap_request, ACAMERA_CONTROL_AF_MODE, 1, &af_mode);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to set af mode.", id.c_str());
-            }
-            s = ACaptureRequest_setEntry_i32(cap_request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fps_range);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to set fps.", id.c_str());
-            }
-            if (ori == 270) {
-                uint8_t scene = ACAMERA_CONTROL_SCENE_MODE_FACE_PRIORITY;
-                s = ACaptureRequest_setEntry_u8(cap_request, ACAMERA_CONTROL_SCENE_MODE, 1, &scene);
-                if (s != ACAMERA_OK) {
-                    log_e("Camera[%s] Failed to set scene mode.", id.c_str());
-                }
-            } else {
-                uint8_t scene = ACAMERA_CONTROL_SCENE_MODE_DISABLED;
-                s = ACaptureRequest_setEntry_u8(cap_request, ACAMERA_CONTROL_SCENE_MODE, 1, &scene);
-                if (s != ACAMERA_OK) {
-                    log_e("Camera[%s] Failed to set scene mode.", id.c_str());
-                }
-            }
-
-            s = ACameraCaptureSession_setRepeatingRequest(cap_session, nullptr, 1, &cap_request, nullptr);
-            if (s != ACAMERA_OK) {
-                log_e("Camera[%s] Failed to set RepeatingRequest.", id.c_str());
-                release();
-                return false;
-            }
-
             if (out_fps) *out_fps = fps_range[0];
-            state = CameraState::Previewing;
-            log_d("Camera[%s] Success to start preview: %d-%d,%d,%d r(%d,%d) p(%d,%d).",
-                  id.c_str(), fps_range[0], fps_range[1], ori, af_mode, req_w, req_h, width, height);
-            return true;
+            return tryPreview();
         }
 
         /*
@@ -1392,17 +1253,147 @@ namespace x {
             }
         }
 
-        void initParams() {
-            ACameraManager *mgr = ACameraManager_create();
-            if (mgr == nullptr) {
-                return;
+        void setupCaptureRequest() {
+            camera_status_t s;
+            s = ACaptureRequest_setEntry_u8(cap_request, ACAMERA_CONTROL_AWB_MODE, 1, &awb);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to set awb.", id.c_str());
+            }
+            s = ACaptureRequest_setEntry_u8(cap_request, ACAMERA_CONTROL_AF_MODE, 1, &af_mode);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to set af mode.", id.c_str());
+            }
+            s = ACaptureRequest_setEntry_i32(cap_request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fps_range);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to set fps.", id.c_str());
+            }
+            if (ori == 270) {
+                uint8_t scene = ACAMERA_CONTROL_SCENE_MODE_FACE_PRIORITY;
+                s = ACaptureRequest_setEntry_u8(cap_request, ACAMERA_CONTROL_SCENE_MODE, 1, &scene);
+                if (s != ACAMERA_OK) {
+                    log_e("Camera[%s] Failed to set scene mode.", id.c_str());
+                }
+            } else {
+                uint8_t scene = ACAMERA_CONTROL_SCENE_MODE_DISABLED;
+                s = ACaptureRequest_setEntry_u8(cap_request, ACAMERA_CONTROL_SCENE_MODE, 1, &scene);
+                if (s != ACAMERA_OK) {
+                    log_e("Camera[%s] Failed to set scene mode.", id.c_str());
+                }
+            }
+        }
+
+        bool tryPreview() {
+            if (width <= 0 || height <= 0) {
+                release();
+                return false;
             }
 
+            if (reader) {
+                AImageReader_setImageListener(reader, nullptr);
+                AImageReader_delete(reader);
+                release();
+                return false;
+            }
+
+            camera_status_t s;
+            media_status_t ms = AImageReader_new(width, height, AIMAGE_FORMAT_YUV_420_888, 2, &reader);
+            if (ms != AMEDIA_OK) {
+                log_e("Camera[%s] Failed to new image reader.", id.c_str());
+                release();
+                return false;
+            }
+
+            if (window) {
+                release();
+                return false;
+            }
+
+            ms = AImageReader_getWindow(reader, &window);
+            if (ms != AMEDIA_OK) {
+                log_e("Camera[%s] Failed to get native window.", id.c_str());
+                release();
+                return false;
+            }
+
+            ANativeWindow_acquire(window);
+            s = ACameraManager_openCamera(mgr, id.c_str(), &ds_callbacks, &dev);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed[%d] to open camera device.", id.c_str(), s);
+                release();
+                return false;
+            }
+
+            s = ACameraDevice_createCaptureRequest(dev, TEMPLATE_RECORD, &cap_request);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to create capture request.", id.c_str());
+                release();
+                return false;
+            }
+
+//            log_d("Camera[%s] Success to create capture request.", id.c_str());
+            s = ACaptureSessionOutputContainer_create(&out_container);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to create session output container.", id.c_str());
+                release();
+                return false;
+            }
+
+            s = ACameraOutputTarget_create(window, &out_target);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to create CameraOutputTarget.", id.c_str());
+                release();
+                return false;
+            }
+
+            s = ACaptureRequest_addTarget(cap_request, out_target);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to add CameraOutputTarget.", id.c_str());
+                release();
+                return false;
+            }
+
+            s = ACaptureSessionOutput_create(window, &out_session);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to create CaptureSessionOutput.", id.c_str());
+                release();
+                return false;
+            }
+
+            s = ACaptureSessionOutputContainer_add(out_container, out_session);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to add CaptureSessionOutput.", id.c_str());
+                release();
+                return false;
+            }
+
+            s = ACameraDevice_createCaptureSession(dev, out_container, &css_callbacks, &cap_session);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed[%d] to create CaptureSession.", id.c_str(), s);
+                release();
+                return false;
+            }
+
+            // setup cap_request params
+            setupCaptureRequest();
+
+            s = ACameraCaptureSession_setRepeatingRequest(cap_session, nullptr, 1, &cap_request, nullptr);
+            if (s != ACAMERA_OK) {
+                log_e("Camera[%s] Failed to set RepeatingRequest.", id.c_str());
+                release();
+                return false;
+            }
+
+            state = CameraState::Previewing;
+            log_d("Camera[%s] Success to start preview: o(%d),fps(%d),wb(%d),af(%d),ps(%d,%d).",
+                  id.c_str(), ori, fps_range[1], awb, af_mode, width, height);
+            return true;
+        }
+
+        void initParams() {
             ACameraMetadata *metadata = nullptr;
             camera_status_t s = ACameraManager_getCameraCharacteristics(mgr, id.c_str(), &metadata);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to get camera meta data.", id.c_str());
-                ACameraManager_delete(mgr);
                 return;
             }
 
@@ -1671,14 +1662,15 @@ namespace x {
         yuv_args yuv_args;
         std::string id;
         std::atomic<CameraState> state;
-        ACameraDevice *dev;
 
     private:
         int32_t width, height, fps_req, fps_range[2], iso_range[2], ori;
         std::vector<uint8_t> awbs;
-        uint8_t af_mode;
+        uint8_t awb, af_mode;
 
     private:
+        ACameraManager *mgr;
+        ACameraDevice *dev;
         AImageReader *reader;
         ANativeWindow *window;
         ACaptureRequest *cap_request;
