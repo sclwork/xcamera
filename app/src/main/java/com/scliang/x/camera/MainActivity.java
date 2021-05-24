@@ -83,12 +83,14 @@ public class MainActivity extends AppCompatActivity {
         Button record = findViewById(R.id.record);
         Button effect = findViewById(R.id.effect);
         Button merge = findViewById(R.id.merge);
+        Button awb = findViewById(R.id.awb);
         if (hasPermission) {
             if (camera != null) camera.setVisibility(View.VISIBLE);
             if (camera != null) camera.setOnClickListener(v -> {
                 if (cs == C01) cs = C10;
                 else if (cs == C10) cs = C01;
                 CameraManager.preview(camMerge, cs);
+                if (awb != null) awb.setText("AUTO");
             });
             if (record != null) record.setVisibility(View.VISIBLE);
             if (record != null) record.setOnClickListener(v -> {
@@ -123,11 +125,43 @@ public class MainActivity extends AppCompatActivity {
                 });
                 listDialog.show();
             });
+            if (awb != null) awb.setVisibility(View.VISIBLE);
+            if (awb != null) awb.setOnClickListener(v -> {
+                String[] items = new String[] { "AUTO", "INCANDESCENT", "FLUORESCENT", "DAYLIGHT", "CLOUDY_DAYLIGHT" };
+                AlertDialog.Builder listDialog = new AlertDialog.Builder(this);
+                listDialog.setItems(items, (dialog, which) -> {
+                    String name = items[which];
+                    int val;
+                    switch (name) {
+                        default:
+                        case "AUTO":
+                            val = 1;
+                            break;
+                        case "INCANDESCENT":
+                            val = 2;
+                            break;
+                        case "FLUORESCENT":
+                            val = 3;
+                            break;
+                        case "DAYLIGHT":
+                            val = 5;
+                            break;
+                        case "CLOUDY_DAYLIGHT":
+                            val = 6;
+                            break;
+                    }
+                    CameraManager.setCameraAWB(cs[0], val, (id, value, result) -> {
+                        if (result) awb.setText(name);
+                    });
+                });
+                listDialog.show();
+            });
         } else {
             if (camera != null) camera.setVisibility(View.GONE);
             if (record != null) record.setVisibility(View.GONE);
             if (effect != null) effect.setVisibility(View.GONE);
             if (merge != null) merge.setVisibility(View.GONE);
+            if (awb != null) awb.setVisibility(View.GONE);
         }
     }
 }

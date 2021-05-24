@@ -135,10 +135,11 @@ namespace x {
      */
     class ImageFrame {
     public:
-        ImageFrame(): ori(0), width(0), height(0), cache(nullptr) {}
+        ImageFrame(): ori(0), width(0), height(0), cache(nullptr), pts(0) {}
 
         ImageFrame(int32_t w, int32_t h, bool perch = false): ori(0), width(w), height(h),
-                                                              cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)) {
+                                                              cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
+                                                              pts(0) {
             if (cache == nullptr) {
                 log_e("ImageFrame malloc image cache fail.");
             } else if (FileRoot != nullptr) {
@@ -164,7 +165,8 @@ namespace x {
 
         ImageFrame(ImageFrame &&frame) noexcept: ori(frame.ori),
                                                  width(frame.width), height(frame.height),
-                                                 cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)) {
+                                                 cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
+                                                 pts(frame.pts) {
             if (cache) {
                 memcpy(cache, frame.cache, sizeof(uint32_t) * width * height);
             }
@@ -172,7 +174,8 @@ namespace x {
 
         ImageFrame(const ImageFrame &frame) noexcept: ori(frame.ori),
                                                       width(frame.width), height(frame.height),
-                                                      cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)) {
+                                                      cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
+                                                      pts(frame.pts) {
             if (cache) {
                 memcpy(cache, frame.cache, sizeof(uint32_t) * width * height);
             }
@@ -187,6 +190,7 @@ namespace x {
                 cache = (uint32_t *) malloc(sizeof(uint32_t) * width * height);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
+            pts = frame.pts;
             return *this;
         }
 
@@ -199,6 +203,7 @@ namespace x {
                 cache = (uint32_t *) malloc(sizeof(uint32_t) * width * height);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
+            pts = frame.pts;
             return *this;
         }
 
@@ -274,10 +279,13 @@ namespace x {
         }
 
     private:
-        int32_t ori;
-        int32_t width;
-        int32_t height;
+        int32_t   ori;
+        int32_t   width;
+        int32_t   height;
         uint32_t *cache;
+
+    public:
+        uint64_t  pts;
     };
 
 
@@ -286,20 +294,23 @@ namespace x {
      */
     class AudioFrame {
     public:
-        AudioFrame(): offset(0), size(0), cache(nullptr) {
+        AudioFrame(): offset(0), size(0), cache(nullptr), pts(0), channels(2) {
         }
 
-        explicit AudioFrame(int32_t sz): offset(0), size(sz),
-                                         cache((uint8_t*)malloc(sizeof(uint8_t)*size)) {
+        explicit AudioFrame(int32_t sz, uint32_t cls): offset(0), size(sz),
+                                                       cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
+                                                       pts(0), channels(cls) {
         }
 
-        AudioFrame(AudioFrame&& frame) noexcept: offset(0), size(frame.size),
-                                                 cache((uint8_t*)malloc(sizeof(uint8_t)*size)) {
+        AudioFrame(AudioFrame&& frame) noexcept: offset(frame.offset), size(frame.size),
+                                                 cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
+                                                 pts(frame.pts), channels(frame.channels) {
             if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
         }
 
-        AudioFrame(const AudioFrame &frame): offset(0), size(frame.size),
-                                             cache((uint8_t*)malloc(sizeof(uint8_t)*size)) {
+        AudioFrame(const AudioFrame &frame): offset(frame.offset), size(frame.size),
+                                             cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
+                                             pts(frame.pts), channels(frame.channels) {
             if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
         }
 
@@ -310,6 +321,8 @@ namespace x {
                 cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            pts = frame.pts;
+            channels = frame.channels;
             return *this;
         }
 
@@ -320,6 +333,8 @@ namespace x {
                 cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            pts = frame.pts;
+            channels = frame.channels;
             return *this;
         }
 
@@ -342,6 +357,13 @@ namespace x {
         void get(int32_t *out_size, uint8_t **out_cache = nullptr) const {
             if (out_size) *out_size = size;
             if (out_cache) *out_cache = cache;
+        }
+        /**
+         * Get frame size
+         * @return frame size
+         */
+        int32_t getSize() const {
+            return size;
         }
         /**
          * get audio frame pcm short data
@@ -389,6 +411,10 @@ namespace x {
         int32_t  offset;
         int32_t  size;
         uint8_t *cache;
+
+    public:
+        uint64_t pts;
+        uint32_t channels;
     };
 
 
@@ -1010,6 +1036,7 @@ namespace x {
         Camera(std::string &&_id, int32_t fps): yuv_args(), id(_id), state(CameraState::None),
                                                 width(0), height(0), fps_req(fps), fps_range(), iso_range(), ori(0),
                                                 awbs(), awb(ACAMERA_CONTROL_AWB_MODE_AUTO), af_mode(ACAMERA_CONTROL_AF_MODE_OFF),
+                                                postAwb(UINT8_MAX),
                                                 mgr(ACameraManager_create()), dev(nullptr), reader(nullptr), window(nullptr),
                                                 cap_request(nullptr), out_container(nullptr),
                                                 out_session(nullptr), cap_session(nullptr), out_target(nullptr),
@@ -1088,8 +1115,36 @@ namespace x {
          * @param _id
          * @return true: _id == camera.id
          */
-        bool equal(const std::string &&_id) {
+        bool equal(const std::string &_id) {
             return _id == id;
+        }
+
+        /**
+         * camera id
+         */
+        std::string&& getId() {
+            std::string d(id);
+            return std::move(d);
+        }
+
+        /**
+         * get supported auto-white balance
+         */
+        int supportedAWBs(std::vector<uint8_t> &wbs) {
+             for (const auto& wb : awbs) wbs.push_back(wb);
+             return awbs.size();
+         }
+
+        /**
+         * change camera auto-white balance
+         */
+        bool postAWB(uint8_t wb) {
+            bool has = false;
+            for(const auto&w:awbs){if(w==wb){has=true;break;}}
+            if (!has) return false;
+            if (awb == wb) return true;
+            postAwb = wb;
+            return true;
         }
 
         /**
@@ -1098,6 +1153,20 @@ namespace x {
          * @param frame [out] latest image frame
          */
         bool getLatestImage(ImageFrame &frame) {
+            if (state != CameraState::Previewing) {
+                return false;
+            }
+
+            if (postAwb != UINT8_MAX) {
+                awb = postAwb;
+                postAwb = UINT8_MAX;
+                restartPreview();
+            }
+
+            if (reader == nullptr) {
+                return false;
+            }
+
             frame.setOrientation(ori);
             media_status_t status = AImageReader_acquireLatestImage(reader, &yuv_args.image);
             if (status != AMEDIA_OK) {
@@ -1185,6 +1254,7 @@ namespace x {
             s = ACameraManager_getCameraCharacteristics(mgr, id.c_str(), &metadata);
             if (s != ACAMERA_OK) {
                 log_e("Camera[%s] Failed to get camera meta data.", id.c_str());
+                release();
                 return false;
             }
 
@@ -1220,6 +1290,11 @@ namespace x {
         Camera& operator=(const Camera&) = delete;
 
     private:
+        bool restartPreview() {
+            close();
+            return tryPreview();
+        }
+
         void release() {
             if (cap_request) {
                 ACaptureRequest_free(cap_request);
@@ -1385,7 +1460,7 @@ namespace x {
 
             state = CameraState::Previewing;
             log_d("Camera[%s] Success to start preview: o(%d),fps(%d),wb(%d),af(%d),ps(%d,%d).",
-                  id.c_str(), ori, fps_range[1], awb, af_mode, width, height);
+                  id.c_str(), ori, fps_range[0], awb, af_mode, width, height);
             return true;
         }
 
@@ -1659,27 +1734,28 @@ namespace x {
         }
 
     private:
-        yuv_args yuv_args;
-        std::string id;
+        yuv_args                 yuv_args;
+        std::string              id;
         std::atomic<CameraState> state;
 
     private:
-        int32_t width, height, fps_req, fps_range[2], iso_range[2], ori;
+        int32_t              width, height, fps_req, fps_range[2], iso_range[2], ori;
         std::vector<uint8_t> awbs;
-        uint8_t awb, af_mode;
+        uint8_t              awb, af_mode;
+        std::atomic_uint8_t  postAwb;
 
     private:
-        ACameraManager *mgr;
-        ACameraDevice *dev;
-        AImageReader *reader;
-        ANativeWindow *window;
-        ACaptureRequest *cap_request;
-        ACaptureSessionOutputContainer *out_container;
-        ACaptureSessionOutput *out_session;
-        ACameraCaptureSession *cap_session;
-        ACameraOutputTarget *out_target;
-        ACameraDevice_StateCallbacks ds_callbacks;
-        ACameraCaptureSession_stateCallbacks css_callbacks;
+        ACameraManager                       *mgr;
+        ACameraDevice                        *dev;
+        AImageReader                         *reader;
+        ANativeWindow                        *window;
+        ACaptureRequest                      *cap_request;
+        ACaptureSessionOutputContainer       *out_container;
+        ACaptureSessionOutput                *out_session;
+        ACameraCaptureSession                *cap_session;
+        ACameraOutputTarget                  *out_target;
+        ACameraDevice_StateCallbacks          ds_callbacks;
+        ACameraCaptureSession_stateCallbacks  css_callbacks;
     };
 
 
@@ -1693,7 +1769,7 @@ namespace x {
                                               rec_obj(nullptr), rec_eng(nullptr), rec_queue(nullptr),
                                               channels(cls<=1?1:2), sampling_rate(spr==44100?SL_SAMPLINGRATE_44_1:SL_SAMPLINGRATE_16),
                                               sample_rate(sampling_rate / 1000), pcm_data((uint8_t*)malloc(sizeof(uint8_t)*(PCM_BUF_SIZE))),
-                                              frm_size(1024*2*channels), frm_changed(false), cache(frm_size), frame(frm_size),
+                                              frm_size(1024*2*channels), frm_changed(false), cache(frm_size, channels), frame(frm_size, channels),
                                               frame_callback(nullptr), frame_ctx(nullptr) {
             log_d("Audio[%d,%d] created.", channels, sample_rate);
             initObjects();
@@ -2138,6 +2214,26 @@ namespace x {
         }
 
     public:
+        void getPreviewingCameraAWBs(std::map<std::string, std::vector<uint8_t>> &awbs) {
+            for (auto& camera : cameras) {
+                if (camera->previewing()) {
+                    std::vector<uint8_t> wbs;
+                    camera->supportedAWBs(wbs);
+                    awbs[camera->getId()] = wbs;
+                }
+            }
+        }
+
+        bool setCameraAWB(std::string &id, uint8_t awb) {
+            for (auto& camera : cameras) {
+                if (camera->equal(id)) {
+                    return camera->postAWB(awb);
+                }
+            }
+            return false;
+        }
+
+    public:
         void start(int32_t width, int32_t height, CameraMerge merge) {
             if (*collectRunnable) return;
             collectRunnable = std::make_shared<std::atomic_bool>(true);
@@ -2322,7 +2418,7 @@ namespace x {
                         imgQ(std::make_shared<ImageQueue>()),
                         audQ(std::make_shared<AudioQueue>()),
                         encodeRunnable(std::make_shared<std::atomic_bool>(false)),
-                        workers() {
+                        workers(), imgPts(0), audPts(0) {
             log_d("VideoEncoder created.");
         }
 
@@ -2334,12 +2430,14 @@ namespace x {
     public:
         void appendImageFrame(ImageFrame &&frm) {
             if (frm.available()) {
+                frm.pts = imgPts; imgPts++;
                 imgQ->enqueue(std::forward<ImageFrame>(frm));
             }
         }
 
         void appendAudioFrame(AudioFrame &&frm) {
             if (frm.available()) {
+                frm.pts = audPts; audPts += frm.getSize() / frm.channels / 2;
                 audQ->enqueue(std::forward<AudioFrame>(frm));
             }
         }
@@ -2388,11 +2486,13 @@ namespace x {
         void clearImageQ() {
             ImageFrame f;
             while (imgQ->try_dequeue(f));
+            imgPts = 0;
         }
 
         void clearAudioQ() {
             AudioFrame f;
             while (audQ->try_dequeue(f));
+            audPts = 0;
         }
 
         void release() {
@@ -2415,6 +2515,7 @@ namespace x {
         std::shared_ptr<AudioQueue>                      audQ;
         std::shared_ptr<std::atomic_bool>                encodeRunnable;
         std::map<int32_t, std::shared_ptr<EncodeWorker>> workers;
+        std::atomic_uint64_t                             imgPts, audPts;
     };
 } // namespace x
 
@@ -2473,19 +2574,6 @@ static void requestGlRender(void *ctx = nullptr) {
 
     if (g_JavaVM != nullptr) {
         g_JavaVM->DetachCurrentThread();
-    }
-}
-
-static void postGlRender(long delayMillis = 0, void* ctx= nullptr) {
-    if (delayMillis <= 0) {
-        std::thread t(requestGlRender, ctx);
-        t.detach();
-    } else {
-        std::thread t([](long delayMillis) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delayMillis));
-            requestGlRender();
-        }, delayMillis);
-        t.detach();
     }
 }
 
@@ -2657,6 +2745,18 @@ jstring cameras, jint merge) {
     }
     env->ReleaseStringUTFChars(cameras, cams);
     return 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_scliang_x_camera_CameraManager_jniSetCameraAWB(
+JNIEnv *env, jobject thiz,
+jstring id, jint awb) {
+    if (g_ImageRecorder == nullptr) return false;
+    const char *cid = env->GetStringUTFChars(id, nullptr);
+    std::string sid(cid);
+    bool res = g_ImageRecorder->setCameraAWB(sid, (uint8_t)awb);
+    env->ReleaseStringUTFChars(id, cid);
+    return res;
 }
 
 JNIEXPORT jboolean JNICALL

@@ -98,6 +98,25 @@ public class CameraManager {
     /*
      *
      */
+    public static void setCameraAWB(String id, int awb, OnSetCameraAWBListener listener) {
+        CameraManager m = SingletonHolder.INSTANCE;
+        if (GlView != null && GlView.get() != null) {
+            GlView.get().queueEvent(()->{
+                boolean res = m.jniSetCameraAWB(id, awb);
+                GlView.get().post(()->{
+                    if (listener != null) listener.onSetCameraAWBCompleted(id, awb, res);
+                });
+            });
+        }
+    }
+    public interface OnSetCameraAWBListener {
+        void onSetCameraAWBCompleted(String id, int awb, boolean result);
+    }
+
+
+    /*
+     *
+     */
     public static boolean recording() {
         CameraManager m = SingletonHolder.INSTANCE;
         return m.jniRecording();
@@ -345,11 +364,18 @@ public class CameraManager {
     private native int jniResume();
     private native int jniPause();
     private native int jniRelease();
+    /*
+     *
+     */
     private native int jniSurfaceCreated();
     private native int jniSurfaceChanged(int width, int height);
     private native int jniUpdatePaint(@NonNull String name);
     private native int jniDrawFrame();
     private native int jniPreview(@NonNull String cameras, int merge);
+    /*
+     *
+     */
+    private native boolean jniSetCameraAWB(String id, int awb);
     /*
      *
      */
