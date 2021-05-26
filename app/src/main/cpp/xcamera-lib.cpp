@@ -74,6 +74,47 @@ namespace x {
     /*
      *
      */
+    class Kalman {
+    public:
+        Kalman(): x_last(0.0), p_last(0.02), Q(0.018), R(0.542), kg(0.0),
+                  x_mid(0.0), x_now(0.0), p_mid(0.0), p_now(0.0), z_real(0.0), z_measure(0.0) {
+            log_d("Kalman created.");
+        }
+
+        ~Kalman() {
+            log_d("Kalman release.");
+        }
+
+    public:
+        double filter(double i) {
+            z_real = i;
+
+            if (x_last == 0.0) {
+                x_last = z_real;
+                x_mid = x_last;
+            }
+
+            x_mid = x_last;
+            p_mid = p_last + Q;
+            kg = p_mid / (p_mid + R);
+            z_measure = z_real;
+            x_now = x_mid + kg * (z_measure - x_mid);
+            p_now = (1 - kg) * p_mid;
+
+            p_last = p_now;
+            x_last = x_now;
+
+            return x_now;
+        }
+
+    private:
+        double x_last, p_last, Q, R, kg, x_mid, x_now, p_mid, p_now, z_real, z_measure;
+    };
+
+
+    /*
+     *
+     */
     class GlUtils {
     public:
         static void setBool(GLuint programId, const std::string &name, bool value) {
@@ -135,11 +176,11 @@ namespace x {
      */
     class ImageFrame {
     public:
-        ImageFrame(): ori(0), width(0), height(0), cache(nullptr), pts(0) {}
+        ImageFrame(): ori(0), width(0), height(0), cache(nullptr), pts(0), tmpdB(0) {}
 
         ImageFrame(int32_t w, int32_t h, bool perch = false): ori(0), width(w), height(h),
                                                               cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                              pts(0) {
+                                                              pts(0), tmpdB(0) {
             if (cache == nullptr) {
                 log_e("ImageFrame malloc image cache fail.");
             } else if (FileRoot != nullptr) {
@@ -166,7 +207,7 @@ namespace x {
         ImageFrame(ImageFrame &&frame) noexcept: ori(frame.ori),
                                                  width(frame.width), height(frame.height),
                                                  cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                 pts(frame.pts) {
+                                                 pts(frame.pts), tmpdB(frame.tmpdB) {
             if (cache) {
                 memcpy(cache, frame.cache, sizeof(uint32_t) * width * height);
             }
@@ -175,7 +216,7 @@ namespace x {
         ImageFrame(const ImageFrame &frame) noexcept: ori(frame.ori),
                                                       width(frame.width), height(frame.height),
                                                       cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                      pts(frame.pts) {
+                                                      pts(frame.pts), tmpdB(frame.tmpdB) {
             if (cache) {
                 memcpy(cache, frame.cache, sizeof(uint32_t) * width * height);
             }
@@ -191,6 +232,7 @@ namespace x {
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
             pts = frame.pts;
+            tmpdB = frame.tmpdB;
             return *this;
         }
 
@@ -204,6 +246,7 @@ namespace x {
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
             pts = frame.pts;
+            tmpdB = frame.tmpdB;
             return *this;
         }
 
@@ -286,6 +329,7 @@ namespace x {
 
     public:
         uint64_t  pts;
+        int32_t   tmpdB;
     };
 
 
@@ -305,13 +349,13 @@ namespace x {
         AudioFrame(AudioFrame&& frame) noexcept: offset(frame.offset), size(frame.size),
                                                  cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
                                                  pts(frame.pts), channels(frame.channels) {
-            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
         }
 
         AudioFrame(const AudioFrame &frame): offset(frame.offset), size(frame.size),
                                              cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
                                              pts(frame.pts), channels(frame.channels) {
-            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
         }
 
         AudioFrame& operator=(AudioFrame&& frame) noexcept {
@@ -320,7 +364,7 @@ namespace x {
                 if (cache) free(cache);
                 cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
             }
-            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
             pts = frame.pts;
             channels = frame.channels;
             return *this;
@@ -332,7 +376,7 @@ namespace x {
                 if (cache) free(cache);
                 cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
             }
-            if (cache) { memcpy(cache, frame.cache, sizeof(int8_t)*size); }
+            if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
             pts = frame.pts;
             channels = frame.channels;
             return *this;
@@ -350,20 +394,20 @@ namespace x {
             return cache != nullptr;
         }
         /**
-         * get audio frame args/pcm data
-         * @param out_size [out] audio pcm data size
-         * @param out_cache [out] audio pcm data pointer
-         */
-        void get(int32_t *out_size, uint8_t **out_cache = nullptr) const {
-            if (out_size) *out_size = size;
-            if (out_cache) *out_cache = cache;
-        }
-        /**
          * Get frame size
          * @return frame size
          */
         int32_t getSize() const {
             return size;
+        }
+        /**
+         * get audio frame args/pcm data
+         * @param out_size [out] audio pcm data size
+         * @param out_cache [out] audio pcm data pointer
+         */
+        void get(int32_t *out_size, uint8_t **out_cache) const {
+            if (out_size) *out_size = size;
+            if (out_cache) *out_cache = cache;
         }
         /**
          * get audio frame pcm short data
@@ -376,7 +420,7 @@ namespace x {
             std::shared_ptr<uint16_t> sht(sa,[](const uint16_t*p){delete[]p;});
             for (int32_t i = 0; i < size / 2; i++) {
                 sa[i] = ((uint16_t)(cache[i * 2])     & 0xff) +
-                        (((uint16_t)(cache[i * 2 + 1]) & 0xff) << 8);
+                       (((uint16_t)(cache[i * 2 + 1]) & 0xff) << 8);
             }
             return sht;
         }
@@ -393,7 +437,6 @@ namespace x {
                 }
             }
         }
-
         void set(const std::shared_ptr<uint16_t> &sht, int32_t length) {
             if (sht != nullptr && length > 0 && length * 2 == size && cache != nullptr) {
                 uint16_t *sd = sht.get();
@@ -402,6 +445,21 @@ namespace x {
                     cache[i * 2 + 1] = (uint8_t)((sd[i] >> 8)  & 0xff);
                 }
             }
+        }
+        /**
+         * Get Average dB
+         */
+        double averagedB() const {
+            double sum = 0;
+            double sample = 0;
+            int16_t value = 0;
+            for(int i = 0; i < size; i += sizeof(int16_t)) {
+                memcpy(&value, cache+i, sizeof(int16_t));
+                sample = value / 32767.0;
+                sum += sample * sample;
+            }
+            double rms = sqrt(sum / ((double)size / sizeof(int16_t)));
+            return 20 * log10(rms);
         }
 
     private:
@@ -548,7 +606,7 @@ namespace x {
             }
 
             bool mirror = frame.useMirror();
-            int32_t width = 0, height = 0;
+            int32_t width = 0, height = 0, dB = frame.tmpdB;
             frame.get(&width, &height);
             uint32_t *data = frame.getData();
 
@@ -584,7 +642,7 @@ namespace x {
             glBindTexture(GL_TEXTURE_2D, texture);
             GlUtils::setInt(effect_program, "s_Texture", 0);
             GlUtils::setMat4(effect_program, "u_MVPMatrix", matrix);
-            setupProgramArgs(effect_program, width, height, mirror);
+            setupProgramArgs(effect_program, width, height, mirror, dB);
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
             glBindFramebuffer(GL_FRAMEBUFFER, GL_NONE);
 
@@ -631,9 +689,10 @@ namespace x {
             dst_fbo = GL_NONE;
         }
 
-        void setupProgramArgs(GLuint prog, int32_t width, int32_t height, bool mirror) {
+        void setupProgramArgs(GLuint prog, int32_t width, int32_t height, bool mirror, int32_t dB) {
             GlUtils::setVec2(prog, "u_TexSize", glm::vec2(width, height));
             GlUtils::setBool(prog, "u_Mirror", mirror);
+            GlUtils::setFloat(prog, "u_dB", dB / 1000.0f);
 
             if (effect == "FACE") {
                 GlUtils::setFloat(prog, "u_Time", frm_index);
@@ -1770,7 +1829,7 @@ namespace x {
                                               channels(cls<=1?1:2), sampling_rate(spr==44100?SL_SAMPLINGRATE_44_1:SL_SAMPLINGRATE_16),
                                               sample_rate(sampling_rate / 1000), pcm_data((uint8_t*)malloc(sizeof(uint8_t)*(PCM_BUF_SIZE))),
                                               frm_size(1024*2*channels), frm_changed(false), cache(frm_size, channels), frame(frm_size, channels),
-                                              frame_callback(nullptr), frame_ctx(nullptr) {
+                                              frame_callback(nullptr), frame_ctx(nullptr), averagedB_callback(nullptr) {
             log_d("Audio[%d,%d] created.", channels, sample_rate);
             initObjects();
         }
@@ -1807,7 +1866,9 @@ namespace x {
          * start audio record
          * @return true: start success
          */
-        bool startRecord(void (*frm_callback)(void *) = nullptr, void *ctx = nullptr) {
+        bool startRecord(void (*frm_callback)(void *) = nullptr,
+                         void *ctx = nullptr,
+                         void (*dB_callback)(double) = nullptr) {
             if (!recordable()) {
                 return false;
             }
@@ -1820,6 +1881,7 @@ namespace x {
             }
             frame_callback = frm_callback;
             frame_ctx = ctx;
+            averagedB_callback = dB_callback;
             log_d("Audio[%d,%d] start record.", channels, sample_rate);
             return true;
         }
@@ -1982,6 +2044,7 @@ namespace x {
                 frm_changed = true;
                 cache.offset = PCM_BUF_SIZE - c;
                 memcpy(cache.cache, pcm_data + c, sizeof(uint8_t) * cache.offset);
+                if (averagedB_callback != nullptr) averagedB_callback(frame.averagedB());
                 if (frame_callback != nullptr) frame_callback(frame_ctx);
             } else {
                 memcpy(cache.cache + cache.offset, pcm_data, sizeof(uint8_t) * PCM_BUF_SIZE);
@@ -2029,6 +2092,7 @@ namespace x {
     private:
         void (*frame_callback)(void *);
         void *frame_ctx;
+        void (*averagedB_callback)(double);
     };
 
 
@@ -2269,9 +2333,12 @@ namespace x {
     class AudioRecorder {
     public:
         AudioRecorder(bool (*recording)(),
-                      void (*completed)(AudioFrame &&)):
+                      void (*completed)(AudioFrame &&),
+                      void (*averagedB)(double) = nullptr):
                         audio(std::make_shared<Audio>()),
-                        checkRecording(recording), frameCompleted(completed) {
+                        checkRecording(recording),
+                        frameCompleted(completed),
+                        averagedBCallback(averagedB) {
             log_d("AudioRecorder created.");
         }
 
@@ -2283,7 +2350,7 @@ namespace x {
     public:
         void start() {
             if (audio->recording()) return;
-            audio->startRecord(AudioRecorder::collectAudio, this);
+            audio->startRecord(AudioRecorder::collectAudio, this, averagedBCallback);
         }
 
         void stop() {
@@ -2315,6 +2382,7 @@ namespace x {
     private:
         bool (*checkRecording)();
         void (*frameCompleted)(AudioFrame &&);
+        void (*averagedBCallback)(double);
     };
 
 
@@ -2371,7 +2439,7 @@ namespace x {
         static bool encodeImageFrame(const std::shared_ptr<EncodeWorker>& worker, ImageFrame &&frame) {
             if (frame.available()) {
                 // TODO: DEBUG
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 return true;
             } else {
                 return false;
@@ -2542,13 +2610,15 @@ static x::ImageRenderer *g_Renderer      = nullptr;
 static x::ImageRecorder *g_ImageRecorder = nullptr;
 static x::AudioRecorder *g_AudioRecorder = nullptr;
 static x::VideoEncoder  *g_Encoder       = nullptr;
+static x::Kalman        *g_dBKalman      = nullptr;
 static x::CameraMerge    g_CamMerge      = x::CameraMerge::Single;
 
 
 /*
  *
  */
-static std::atomic_bool  g_Recording;
+static std::atomic_int32_t g_TmpdB;
+static std::atomic_bool    g_Recording;
 
 
 /*
@@ -2581,12 +2651,23 @@ static void requestGlRender(void *ctx = nullptr) {
 /*
  *
  */
+static void onAudioAveragedB(double dB) {
+    if (dB > INT32_MIN && dB < INT32_MAX) {
+        g_TmpdB = (int32_t)(g_dBKalman->filter(dB) * 1000);
+    }
+}
+
 static bool checkVideoRecording() {
     return g_Recording;
 }
 
+
+/*
+ *
+ */
 static void x::postRendererImageFrame(x::ImageFrame &frame) {
     if (g_Renderer != nullptr) {
+        frame.tmpdB = g_TmpdB;
         g_Renderer->appendFrame(std::forward<x::ImageFrame>(frame));
         requestGlRender();
     }
@@ -2633,6 +2714,7 @@ jstring fileRootPath) {
     x::EffectName = new std::string("NONE");
     g_Encoder = new x::VideoEncoder();
     g_Renderer = new x::ImageRenderer(*x::EffectName, checkVideoRecording, x::postEncoderImageFrame);
+    g_dBKalman = new x::Kalman();
     g_CamMerge  = x::CameraMerge::Single;
     return 0;
 }
@@ -2640,6 +2722,7 @@ jstring fileRootPath) {
 JNIEXPORT jint JNICALL
 Java_com_scliang_x_camera_CameraManager_jniResume(
 JNIEnv *env, jobject thiz) {
+    g_TmpdB = 0;
     return 0;
 }
 
@@ -2675,6 +2758,8 @@ JNIEnv *env, jobject thiz) {
     g_Renderer = nullptr;
     delete g_Encoder;
     g_Encoder = nullptr;
+    delete g_dBKalman;
+    g_dBKalman = nullptr;
     log_d("JNI release.");
     return 0;
 }
@@ -2737,7 +2822,9 @@ jstring cameras, jint merge) {
     g_ImageRecorder = new x::ImageRecorder(std::string(cams));
     g_CamMerge = (x::CameraMerge)merge;
     if (g_AudioRecorder == nullptr) {
-        g_AudioRecorder = new x::AudioRecorder(checkVideoRecording, x::postEncoderAudioFrame);
+        g_AudioRecorder = new x::AudioRecorder(checkVideoRecording,
+                                               x::postEncoderAudioFrame,
+                                               onAudioAveragedB);
     }
     if (g_Renderer != nullptr && g_Renderer->getWidth() > 0 && g_Renderer->getHeight() > 0) {
         g_ImageRecorder->start(g_Renderer->getWidth(), g_Renderer->getHeight(), g_CamMerge);
