@@ -283,6 +283,9 @@ public class CameraManager {
                 R.raw.shader_frag_effect_fastblur,
                 "shader_frag_effect_fastblur.glsl");
         getShaderFile(context,
+                R.raw.shader_frag_effect_gaussianblur,
+                "shader_frag_effect_gaussianblur.glsl");
+        getShaderFile(context,
                 R.raw.shader_frag_effect_illustration,
                 "shader_frag_effect_illustration.glsl");
         getShaderFile(context,

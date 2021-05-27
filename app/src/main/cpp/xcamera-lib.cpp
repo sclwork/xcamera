@@ -302,7 +302,7 @@ namespace x {
         /**
          * @return true: if camera/image orientation is 270
          */
-        bool useMirror() const
+        bool mirror() const
             { return ori == 270; }
 
         /**
@@ -605,7 +605,7 @@ namespace x {
                 return;
             }
 
-            bool mirror = frame.useMirror();
+            bool mirror = frame.mirror();
             int32_t width = 0, height = 0, dB = frame.tmpdB;
             frame.get(&width, &height);
             uint32_t *data = frame.getData();
@@ -844,6 +844,8 @@ namespace x {
                 name = "/shader_frag_effect_fastblur.glsl";
             } else if (effect == "BARRELBLUR") {
                 name = "/shader_frag_effect_barrelblur.glsl";
+            } else if (effect == "GAUSSIANBLUR") {
+                name = "/shader_frag_effect_gaussianblur.glsl";
             } else if (effect == "ILLUSTRATION") {
                 name = "/shader_frag_effect_illustration.glsl";
             } else if (effect == "HEXAGON") {
@@ -2197,7 +2199,7 @@ namespace x {
             for (const auto &camera : collector->cameras) {
                 if (camera->previewing()) {
                     if (camera->getLatestImage(*collector->camFrames[i])) {
-                        if (collector->camFrames[i]->useMirror()) {
+                        if (collector->camFrames[i]->mirror()) {
                             auto *data = collector->camFrames[i]->getData();
                             cv::Mat ot(collector->camHeight, collector->camWidth, CV_8UC4, data);
                             cv::flip(ot, ot, 1);
