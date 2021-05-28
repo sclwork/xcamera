@@ -25,6 +25,10 @@
 #include <camera/NdkCameraManager.h>
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
+#include <MNN/Interpreter.hpp>
+#include <MNN/MNNDefine.h>
+#include <MNN/Tensor.hpp>
+#include <MNN/ImageProcess.hpp>
 
 #define log_d(...)  __android_log_print(ANDROID_LOG_DEBUG, "xcamera", __VA_ARGS__)
 #define log_e(...)  __android_log_print(ANDROID_LOG_ERROR, "xcamera", __VA_ARGS__)
@@ -74,10 +78,24 @@ namespace x {
     /*
      *
      */
+    typedef struct face_args {
+        float xmin0, ymin0, xmax0, ymax0, xmin1, ymin1, xmax1, ymax1;
+        float aw, ah, ai, au, xcenter, ycenter, bw, bh, ss;
+        float ymin, xmin, ymax, xmax, nonface_prob, face_prob;
+    } face_args;
+
+
+    /*
+     *
+     */
     class Kalman {
     public:
-        Kalman(): x_last(0.0), p_last(0.02), Q(0.018), R(0.542), kg(0.0),
-                  x_mid(0.0), x_now(0.0), p_mid(0.0), p_now(0.0), z_real(0.0), z_measure(0.0) {
+        explicit Kalman(double p = 0.02,
+                        double q = 0.018,
+                        double r = 0.542): i_p(p), i_Q(q), i_R(r),
+                                           x_last(0.0), p_last(i_p), Q(i_Q), R(i_R), kg(0.0),
+                                           x_mid(0.0), x_now(0.0), p_mid(0.0), p_now(0.0),
+                                           z_real(0.0), z_measure(0.0) {
             log_d("Kalman created.");
         }
 
@@ -86,6 +104,20 @@ namespace x {
         }
 
     public:
+        void reset() {
+            x_last = 0.0;
+            p_last = i_p;
+            Q = i_Q;
+            R = i_R;
+            kg = 0.0;
+            x_mid = 0.0;
+            x_now = 0.0;
+            p_mid = 0.0;
+            p_now = 0.0;
+            z_real = 0.0;
+            z_measure = 0.0;
+        }
+
         double filter(double i) {
             z_real = i;
 
@@ -108,6 +140,7 @@ namespace x {
         }
 
     private:
+        double i_p, i_Q, i_R;
         double x_last, p_last, Q, R, kg, x_mid, x_now, p_mid, p_now, z_real, z_measure;
     };
 
@@ -176,11 +209,12 @@ namespace x {
      */
     class ImageFrame {
     public:
-        ImageFrame(): ori(0), width(0), height(0), cache(nullptr), pts(0), tmpdB(0) {}
+        ImageFrame(): ori(0), width(0), height(0), cache(nullptr),
+                      faces(), fFaceCenter(), pts(0), tmpdB(0) {}
 
         ImageFrame(int32_t w, int32_t h, bool perch = false): ori(0), width(w), height(h),
                                                               cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                              pts(0), tmpdB(0) {
+                                                              faces(), fFaceCenter(), pts(0), tmpdB(0) {
             if (cache == nullptr) {
                 log_e("ImageFrame malloc image cache fail.");
             } else if (FileRoot != nullptr) {
@@ -207,19 +241,19 @@ namespace x {
         ImageFrame(ImageFrame &&frame) noexcept: ori(frame.ori),
                                                  width(frame.width), height(frame.height),
                                                  cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                 pts(frame.pts), tmpdB(frame.tmpdB) {
-            if (cache) {
-                memcpy(cache, frame.cache, sizeof(uint32_t) * width * height);
-            }
+                                                 faces(), fFaceCenter(), pts(frame.pts), tmpdB(frame.tmpdB) {
+            if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
+            faces = frame.faces;
+            fFaceCenter = frame.fFaceCenter;
         }
 
         ImageFrame(const ImageFrame &frame) noexcept: ori(frame.ori),
                                                       width(frame.width), height(frame.height),
                                                       cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                      pts(frame.pts), tmpdB(frame.tmpdB) {
-            if (cache) {
-                memcpy(cache, frame.cache, sizeof(uint32_t) * width * height);
-            }
+                                                      faces(), fFaceCenter(), pts(frame.pts), tmpdB(frame.tmpdB) {
+            if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
+            faces = frame.faces;
+            fFaceCenter = frame.fFaceCenter;
         }
 
         ImageFrame& operator=(ImageFrame &&frame) noexcept {
@@ -231,6 +265,8 @@ namespace x {
                 cache = (uint32_t *) malloc(sizeof(uint32_t) * width * height);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
+            faces = frame.faces;
+            fFaceCenter = frame.fFaceCenter;
             pts = frame.pts;
             tmpdB = frame.tmpdB;
             return *this;
@@ -245,6 +281,8 @@ namespace x {
                 cache = (uint32_t *) malloc(sizeof(uint32_t) * width * height);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
+            faces = frame.faces;
+            fFaceCenter = frame.fFaceCenter;
             pts = frame.pts;
             tmpdB = frame.tmpdB;
             return *this;
@@ -317,8 +355,25 @@ namespace x {
             if (out_cache) *out_cache = cache;
         }
 
+        /*
+         *
+         */
         uint32_t *getData() const {
             return cache;
+        }
+
+        /*
+         *
+         */
+        const std::vector<cv::Rect>& getFaces() const {
+            return faces;
+        }
+
+        /*
+         *
+         */
+        const cv::Point& getFirstFaceCenter() const {
+            return fFaceCenter;
         }
 
     private:
@@ -326,6 +381,11 @@ namespace x {
         int32_t   width;
         int32_t   height;
         uint32_t *cache;
+
+    private:
+        friend class MnnFace;
+        std::vector<cv::Rect> faces;
+        cv::Point fFaceCenter;
 
     public:
         uint64_t  pts;
@@ -499,6 +559,214 @@ namespace x {
     /*
      *
      */
+    class MnnFace {
+    public:
+        MnnFace(): face_args(), b_net(nullptr), b_session(nullptr), b_input(nullptr),
+                   b_out_scores(nullptr), b_out_boxes(nullptr), b_out_anchors(nullptr),
+                   fKmFaceCX(0.02, 0.16, 0.542), fKmFaceCX2(),
+                   fKmFaceCY(0.02, 0.16, 0.542), fKmFaceCY2(),
+                   fTpFaceCX(), fTpFaceCY() {
+            std::string name(*FileRoot + "/blazeface.mnn");
+            b_net = std::shared_ptr<MNN::Interpreter>(MNN::Interpreter::createFromFile(name.c_str()));
+            if (b_net == nullptr) {
+                log_e("MnnFace b_net create fail.");
+            } else {
+                MNN::ScheduleConfig config;
+                config.numThread = 1;
+                config.type = MNNForwardType::MNN_FORWARD_AUTO;
+                config.backupType = MNNForwardType::MNN_FORWARD_OPENCL;
+
+                MNN::BackendConfig backendConfig;
+                backendConfig.precision = MNN::BackendConfig::Precision_Low;
+                backendConfig.power = MNN::BackendConfig::Power_High;
+                config.backendConfig = &backendConfig;
+
+                b_session = b_net->createSession(config);
+                b_input = b_net->getSessionInput(b_session, nullptr);
+                b_out_scores = b_net->getSessionOutput(b_session, "convert_scores");
+                b_out_boxes = b_net->getSessionOutput(b_session, "Squeeze");
+                b_out_anchors = b_net->getSessionOutput(b_session, "anchors");
+            }
+            log_d("MnnFace created.");
+        }
+
+        ~MnnFace() {
+            if (b_net != nullptr) b_net->releaseModel();
+            log_d("MnnFace release.");
+        }
+
+    public:
+        int32_t detect(ImageFrame &frame, const int32_t min_face = 64) {
+            int32_t width, height; uint32_t *data;
+            frame.get(&width, &height, &data);
+
+            cv::Mat img;
+            cv::Mat origin(height, width, CV_8UC4, (unsigned char *) data);
+            cvtColor(origin, img, cv::COLOR_RGBA2BGR);
+
+            int32_t raw_image_width  = img.cols;
+            int32_t raw_image_height = img.rows;
+
+            cv::Mat image;
+            cv::resize(img, image, cv::Size(INPUT_SIZE, INPUT_SIZE));
+            image.convertTo(image, CV_32FC3);
+            image = (image * 2 / 255.0f) - 1;
+
+            std::vector<int32_t> dims{1, INPUT_SIZE, INPUT_SIZE, 3};
+            auto nhwc_tensor = MNN::Tensor::create<float>(dims, nullptr, MNN::Tensor::TENSORFLOW);
+            auto nhwc_data = nhwc_tensor->host<float>();
+            auto nhwc_size = nhwc_tensor->size();
+            ::memcpy(nhwc_data, image.data, nhwc_size);
+
+            b_input->copyFromHostTensor(nhwc_tensor);
+            b_net->runSession(b_session);
+
+            MNN::Tensor tensor_scores_host(b_out_scores, b_out_scores->getDimensionType());
+            MNN::Tensor tensor_boxes_host(b_out_boxes, b_out_boxes->getDimensionType());
+            MNN::Tensor tensor_anchors_host(b_out_anchors, b_out_anchors->getDimensionType());
+
+            b_out_scores->copyToHostTensor(&tensor_scores_host);
+            b_out_boxes->copyToHostTensor(&tensor_boxes_host);
+            b_out_anchors->copyToHostTensor(&tensor_anchors_host);
+
+            auto scores_dataPtr  = tensor_scores_host.host<float>();
+            auto boxes_dataPtr   = tensor_boxes_host.host<float>();
+            auto anchors_dataPtr = tensor_anchors_host.host<float>();
+
+            std::vector<cv::Rect> tmp_faces;
+            for(int32_t i = 0; i < OUTPUT_NUM; ++i) {
+                face_args.ycenter = boxes_dataPtr[i*4 + 0] / Y_SCALE  * anchors_dataPtr[i*4 + 2] + anchors_dataPtr[i*4 + 0];
+                face_args.xcenter = boxes_dataPtr[i*4 + 1] / X_SCALE  * anchors_dataPtr[i*4 + 3] + anchors_dataPtr[i*4 + 1];
+                face_args.bh       = exp(boxes_dataPtr[i*4 + 2] / H_SCALE) * anchors_dataPtr[i*4 + 2];
+                face_args.bw       = exp(boxes_dataPtr[i*4 + 3] / W_SCALE) * anchors_dataPtr[i*4 + 3];
+
+                face_args.ymin    = (float)(face_args.ycenter - face_args.bh * 0.5) * (float)raw_image_height;
+                face_args.xmin    = (float)(face_args.xcenter - face_args.bw * 0.5) * (float)raw_image_width;
+                face_args.ymax    = (float)(face_args.ycenter + face_args.bh * 0.5) * (float)raw_image_height;
+                face_args.xmax    = (float)(face_args.xcenter + face_args.bw * 0.5) * (float)raw_image_width;
+
+                face_args.nonface_prob = exp(scores_dataPtr[i*2 + 0]);
+                face_args.face_prob    = exp(scores_dataPtr[i*2 + 1]);
+
+                face_args.ss           = face_args.nonface_prob + face_args.face_prob;
+                face_args.nonface_prob /= face_args.ss;
+                face_args.face_prob    /= face_args.ss;
+
+                if (face_args.face_prob > score_threshold &&
+                    face_args.xmax - face_args.xmin >= (float)min_face &&
+                    face_args.ymax - face_args.ymin >= (float)min_face) {
+                    cv::Rect tmp_face;
+                    tmp_face.x = face_args.xmin;
+                    tmp_face.y = face_args.ymin;
+                    tmp_face.width  = face_args.xmax - face_args.xmin;
+                    tmp_face.height = face_args.ymax - face_args.ymin;
+                    tmp_faces.push_back(tmp_face);
+                }
+            }
+
+            int32_t N = tmp_faces.size();
+            std::vector<int32_t> labels(N, -1);
+            for(int32_t i = 0; i < N-1; ++i) {
+                for (int32_t j = i+1; j < N; ++j) {
+                    cv::Rect pre_box = tmp_faces[i];
+                    cv::Rect cur_box = tmp_faces[j];
+                    float iou_ = iou(face_args, pre_box, cur_box);
+                    if (iou_ > nms_threshold) {
+                        labels[j] = 0;
+                    }
+                }
+            }
+
+            int32_t count = 0;
+            std::vector<cv::Rect> ef; frame.faces.swap(ef);
+            for (int32_t i = 0; i < N; ++i) {
+                if (labels[i] == -1) {
+                    frame.faces.push_back(tmp_faces[i]);
+                    ++count;
+                }
+            }
+
+            delete nhwc_tensor;
+            img.release();
+            image.release();
+            origin.release();
+
+            return count;
+        }
+
+        void flagFirstFace(ImageFrame &frame) {
+            if (!frame.faces.empty()) {
+                auto f = frame.faces.front();
+                double tx = fKmFaceCX.filter(f.x+f.width/2.0);
+                if (abs(tx - fTpFaceCX) > 9) {
+                    frame.fFaceCenter.x = tx;
+                    fKmFaceCX2.reset();
+                } else {
+                    frame.fFaceCenter.x = fKmFaceCX2.filter(tx);
+                }
+                double ty = fKmFaceCY.filter(f.y+f.height/2.0);
+                if (abs(ty - fTpFaceCY) > 9) {
+                    frame.fFaceCenter.y = ty;
+                    fKmFaceCY2.reset();
+                } else {
+                    frame.fFaceCenter.y = fKmFaceCY2.filter(ty);
+                }
+                fTpFaceCX = frame.fFaceCenter.x;
+                fTpFaceCY = frame.fFaceCenter.y;
+            } else {
+                frame.fFaceCenter.x = 0;
+                frame.fFaceCenter.y = 0;
+            }
+        }
+
+    private:
+        static float iou(struct face_args &face_args, const cv::Rect &box0, const cv::Rect &box1) {
+            face_args.xmin0 = box0.x;
+            face_args.ymin0 = box0.y;
+            face_args.xmax0 = (float)box0.x + box0.width;
+            face_args.ymax0 = (float)box0.y + box0.height;
+            face_args.xmin1 = box1.x;
+            face_args.ymin1 = box1.y;
+            face_args.xmax1 = (float)box1.x + box1.width;
+            face_args.ymax1 = (float)box1.y + box1.height;
+            face_args.aw = fmax(0.0f, fmin(face_args.xmax0, face_args.xmax1) - fmax(face_args.xmin0, face_args.xmin1));
+            face_args.ah = fmax(0.0f, fmin(face_args.ymax0, face_args.ymax1) - fmax(face_args.ymin0, face_args.ymin1));
+            face_args.ai = face_args.aw * face_args.ah;
+            face_args.au = (face_args.xmax0 - face_args.xmin0) * (face_args.ymax0 - face_args.ymin0) +
+                           (face_args.xmax1 - face_args.xmin1) * (face_args.ymax1 - face_args.ymin1) - face_args.ai;
+            if (face_args.au <= 0.0) return 0.0f;
+            else                     return face_args.ai / face_args.au;
+        }
+
+    private:
+        constexpr static const int32_t INPUT_SIZE    = 128;
+        constexpr static const int32_t OUTPUT_NUM    = 960;
+        constexpr static const float X_SCALE         = 10.0f;
+        constexpr static const float Y_SCALE         = 10.0f;
+        constexpr static const float H_SCALE         = 5.0f;
+        constexpr static const float W_SCALE         = 5.0f;
+        constexpr static const float score_threshold = 0.5f;
+        constexpr static const float nms_threshold   = 0.45f;
+
+    private:
+        struct face_args face_args;
+        std::shared_ptr<MNN::Interpreter> b_net;
+        MNN::Session *b_session;
+        MNN::Tensor  *b_input;
+        MNN::Tensor  *b_out_scores;
+        MNN::Tensor  *b_out_boxes;
+        MNN::Tensor  *b_out_anchors;
+
+    private:
+        Kalman fKmFaceCX, fKmFaceCX2;
+        Kalman fKmFaceCY, fKmFaceCY2;
+        double fTpFaceCX, fTpFaceCY;
+    };
+
+
+    /*
+     *
+     */
     class ImagePaint {
     public:
         explicit ImagePaint(const std::string &&e_name): effect(e_name), rf(),
@@ -606,9 +874,9 @@ namespace x {
             }
 
             bool mirror = frame.mirror();
-            int32_t width = 0, height = 0, dB = frame.tmpdB;
+            int32_t width = 0, height = 0;
             frame.get(&width, &height);
-            uint32_t *data = frame.getData();
+            const uint32_t *data = frame.getData();
 
             glClear(GL_STENCIL_BUFFER_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             if(effect_program == GL_NONE || src_fbo == GL_NONE || data == nullptr) {
@@ -642,7 +910,7 @@ namespace x {
             glBindTexture(GL_TEXTURE_2D, texture);
             GlUtils::setInt(effect_program, "s_Texture", 0);
             GlUtils::setMat4(effect_program, "u_MVPMatrix", matrix);
-            setupProgramArgs(effect_program, width, height, mirror, dB);
+            setupProgramArgs(effect_program, width, height, mirror, frame);
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
             glBindFramebuffer(GL_FRAMEBUFFER, GL_NONE);
 
@@ -689,15 +957,24 @@ namespace x {
             dst_fbo = GL_NONE;
         }
 
-        void setupProgramArgs(GLuint prog, int32_t width, int32_t height, bool mirror, int32_t dB) {
+        void setupProgramArgs(GLuint prog, int32_t width, int32_t height, bool mirror, const ImageFrame &frame) {
             GlUtils::setVec2(prog, "u_TexSize", glm::vec2(width, height));
             GlUtils::setBool(prog, "u_Mirror", mirror);
-            GlUtils::setFloat(prog, "u_dB", dB / 1000.0f);
+            GlUtils::setFloat(prog, "u_dB", frame.tmpdB / 1000.0f);
 
             if (effect == "FACE") {
                 GlUtils::setFloat(prog, "u_Time", frm_index);
-                GlUtils::setInt(prog, "u_FaceCount", 0);
-                GlUtils::setVec4(prog, "u_FaceRect", glm::vec4(0, 0, 0, 0));
+                const std::vector<cv::Rect>& faces = frame.getFaces();
+                if (faces.empty()) {
+                    GlUtils::setInt(prog, "u_FaceCount", 0);
+                    GlUtils::setVec4(prog, "u_FaceRect", glm::vec4(0, 0, 0, 0));
+                } else {
+                    auto f = faces.front();
+                    GlUtils::setInt(prog, "u_FaceCount", faces.size());
+                    GlUtils::setVec4(prog, "u_FaceRect", glm::vec4(f.x, f.y, f.x + f.width, f.y + f.height));
+                    auto c = frame.getFirstFaceCenter();
+                    GlUtils::setVec2(prog, "u_FaceCenter", glm::vec2(c.x, c.y));
+                }
             } else if (effect == "RIPPLE") {
                 auto time = (float)(fmod(frm_index, 200) / 160);
                 if (time == 0.0) {
@@ -706,8 +983,17 @@ namespace x {
                     rf[0][2] = random() % width; rf[1][2] = random() % height;
                 }
                 GlUtils::setFloat(prog, "u_Time", time * 2.5f);
-                GlUtils::setInt(prog, "u_FaceCount", 0);
-                GlUtils::setVec4(prog, "u_FaceRect", glm::vec4(rf[0][0], rf[1][0], rf[0][0] + 80, rf[1][0] + 80));
+                const std::vector<cv::Rect>& faces = frame.getFaces();
+                if (faces.empty()) {
+                    GlUtils::setInt(prog, "u_FaceCount", 0);
+                    GlUtils::setVec4(prog, "u_FaceRect", glm::vec4(rf[0][0], rf[1][0], rf[0][0] + 80, rf[1][0] + 80));
+                } else {
+                    auto f = faces.front();
+                    GlUtils::setInt(prog, "u_FaceCount", faces.size());
+                    GlUtils::setVec4(prog, "u_FaceRect", glm::vec4(f.x, f.y, f.x + f.width, f.y + f.height));
+                    auto c = frame.getFirstFaceCenter();
+                    GlUtils::setVec2(prog, "u_FaceCenter", glm::vec2(c.x, c.y));
+                }
                 GlUtils::setVec4(prog, "u_RPoint", glm::vec4(rf[0][1] + 40, rf[1][1] + 40, rf[0][2] + 40, rf[1][2] + 40));
                 GlUtils::setVec2(prog, "u_ROffset", glm::vec2(10 + random() % 10, 10 + random() % 10));
                 GlUtils::setFloat(prog, "u_Boundary", 0.12);
@@ -2613,6 +2899,7 @@ static x::ImageRecorder *g_ImageRecorder = nullptr;
 static x::AudioRecorder *g_AudioRecorder = nullptr;
 static x::VideoEncoder  *g_Encoder       = nullptr;
 static x::Kalman        *g_dBKalman      = nullptr;
+static x::MnnFace       *g_MnnFace       = nullptr;
 static x::CameraMerge    g_CamMerge      = x::CameraMerge::Single;
 
 
@@ -2668,6 +2955,13 @@ static bool checkVideoRecording() {
  *
  */
 static void x::postRendererImageFrame(x::ImageFrame &frame) {
+    if (g_MnnFace == nullptr) {
+        g_MnnFace = new x::MnnFace();
+    }
+    if (g_MnnFace != nullptr) {
+        g_MnnFace->detect(frame);
+        g_MnnFace->flagFirstFace(frame);
+    }
     if (g_Renderer != nullptr) {
         frame.tmpdB = g_TmpdB;
         g_Renderer->appendFrame(std::forward<x::ImageFrame>(frame));
@@ -2762,6 +3056,8 @@ JNIEnv *env, jobject thiz) {
     g_Encoder = nullptr;
     delete g_dBKalman;
     g_dBKalman = nullptr;
+    delete g_MnnFace;
+    g_MnnFace = nullptr;
     log_d("JNI release.");
     return 0;
 }

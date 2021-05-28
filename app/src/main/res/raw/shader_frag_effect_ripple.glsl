@@ -4,12 +4,35 @@ in vec2 v_texCoord;
 layout(location = 0) out vec4 outColor;
 uniform sampler2D s_Texture;
 uniform vec2 u_TexSize;
+uniform float u_dB;
 uniform int u_FaceCount;
 uniform vec4 u_FaceRect;
 uniform float u_Time;
 uniform float u_Boundary;
 uniform vec4 u_RPoint;
 uniform vec2 u_ROffset;
+
+vec4 mix_audio_color(vec4 tColor) {
+    const float led_w = 0.004;
+    if (v_texCoord.x > led_w && v_texCoord.x < 1.0-led_w) { return tColor; }
+    // create pixel coordinates
+    vec2 uv = vec2(0.1, gl_FragCoord.y) / vec2(1.0, u_TexSize.y);
+    // quantize coordinates
+    const float bands = 1.0; const float segs = 60.0;
+    vec2 p = vec2(floor(uv.x * bands) / bands, floor(uv.y * segs) / segs);
+    // read frequency data from first row of texture
+    float fft  = (46.0 + u_dB) / 46.0;
+    // led color
+    vec3 color = mix(vec3(0.0, 2.0, 0.0), vec3(2.0, 0.0, 0.0), sqrt(uv.y));
+    // mask for bar graph
+    float mask = (p.y < fft) ? 1.0 : 0.2;
+    // led shape
+    vec2 d = fract((uv - p) * vec2(bands, segs)) - 0.5;
+    float led = smoothstep(0.5, 0.35, abs(d.x)) * smoothstep(0.5, 0.35, abs(d.y));
+    vec3 ledColor = led * color * mask;
+    // output final color
+    return vec4(ledColor, 1.0);
+}
 
 vec2 ripple(vec2 tc, float of, float cx, float cy) {
     float ratio = u_TexSize.y / u_TexSize.x;
@@ -28,7 +51,7 @@ vec2 ripple(vec2 tc, float of, float cx, float cy) {
     return texCoord;
 }
 
-void main() {
+vec4 ripple_color() {
     float fx = u_FaceRect.x / u_TexSize.x;
     float fy = u_FaceRect.y / u_TexSize.y;
     float fz = u_FaceRect.z / u_TexSize.x;
@@ -38,5 +61,9 @@ void main() {
     vec2 tc = ripple(v_texCoord, 20.0, cx, cy);
     tc=ripple(tc,u_ROffset.x,u_RPoint.x/u_TexSize.x,u_RPoint.y/u_TexSize.y);
     tc=ripple(tc,u_ROffset.y,u_RPoint.z/u_TexSize.x,u_RPoint.w/u_TexSize.y);
-    outColor = texture(s_Texture, tc);
+    return texture(s_Texture, tc);
+}
+
+void main() {
+    outColor = mix_audio_color(ripple_color());
 }

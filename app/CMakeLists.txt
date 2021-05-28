@@ -28,6 +28,22 @@ add_library(opencv4 SHARED IMPORTED)
 set_target_properties(opencv4 PROPERTIES IMPORTED_LOCATION
         ${CMAKE_SOURCE_DIR}/jniLibs/${CMAKE_ANDROID_ARCH_ABI}/libopencv_java4.so)
 
+add_library(mnn SHARED IMPORTED)
+set_target_properties(mnn PROPERTIES IMPORTED_LOCATION
+        ${CMAKE_SOURCE_DIR}/jniLibs/${CMAKE_ANDROID_ARCH_ABI}/libMNN.so)
+add_library(mnn_expr SHARED IMPORTED)
+set_target_properties(mnn_expr PROPERTIES IMPORTED_LOCATION
+        ${CMAKE_SOURCE_DIR}/jniLibs/${CMAKE_ANDROID_ARCH_ABI}/libMNN_Express.so)
+add_library(mnn_cl SHARED IMPORTED)
+set_target_properties(mnn_cl PROPERTIES IMPORTED_LOCATION
+        ${CMAKE_SOURCE_DIR}/jniLibs/${CMAKE_ANDROID_ARCH_ABI}/libMNN_CL.so)
+add_library(mnn_gl SHARED IMPORTED)
+set_target_properties(mnn_gl PROPERTIES IMPORTED_LOCATION
+        ${CMAKE_SOURCE_DIR}/jniLibs/${CMAKE_ANDROID_ARCH_ABI}/libMNN_GL.so)
+add_library(mnn_vulkan SHARED IMPORTED)
+set_target_properties(mnn_vulkan PROPERTIES IMPORTED_LOCATION
+        ${CMAKE_SOURCE_DIR}/jniLibs/${CMAKE_ANDROID_ARCH_ABI}/libMNN_Vulkan.so)
+
 include_directories(
         src/main/cpp/include )
 
@@ -98,6 +114,12 @@ target_link_libraries( # Specifies the target library.
 
         # opencv
         opencv4
+        # mnn
+        mnn
+        mnn_expr
+        mnn_cl
+        mnn_gl
+        mnn_vulkan
         # yuv
         libyuv
         # android ndk library

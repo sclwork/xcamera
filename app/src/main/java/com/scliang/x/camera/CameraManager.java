@@ -144,6 +144,7 @@ public class CameraManager {
         effectNames.clear();
         setupGlslFiles(context);
         setupErrorTipFile(context);
+        setupMnnResFile(context);
     }
 
 
@@ -306,6 +307,31 @@ public class CameraManager {
         getShaderFile(context,
                 R.raw.shader_vert_effect_none,
                 "shader_vert_effect_none.glsl");
+    }
+
+    private void setupMnnResFile(Context context) {
+        InputStream is = null;
+        FileOutputStream os = null;
+        try {
+            is = context.getResources().openRawResource(R.raw.blazeface);
+            File dir = context.getDir("files", Context.MODE_PRIVATE);
+            File file = new File(dir, "blazeface.mnn");
+            if (file.exists()) file.delete();
+            os = new FileOutputStream(file);
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = is.read(buffer)) != -1)
+                os.write(buffer, 0, bytesRead);
+
+            file.getAbsolutePath();
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try { if (is != null) is.close();
+            } catch (IOException ignored) { }
+            try { if (os != null) os.close();
+            } catch (IOException ignored) { }
+        }
     }
 
 
