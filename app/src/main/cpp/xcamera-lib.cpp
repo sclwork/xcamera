@@ -1314,7 +1314,7 @@ namespace x {
                 if (checkRecording != nullptr && checkRecording() && frameCompleted != nullptr) {
                     ImageFrame of;
                     paint->draw(nf, &of);
-                    frameCompleted(std::move(of));
+                    frameCompleted(std::forward<ImageFrame>(of));
                 } else {
                     paint->draw(nf);
                 }
@@ -2112,13 +2112,16 @@ namespace x {
     class Audio {
     public:
         explicit Audio(uint32_t cls = 2,
-                       uint32_t spr = 44100): eng_obj(nullptr), eng_eng(nullptr),
+                       uint32_t spr = 48000,
+                       uint32_t perms = 1): eng_obj(nullptr), eng_eng(nullptr),
                                               rec_obj(nullptr), rec_eng(nullptr), rec_queue(nullptr),
-                                              channels(cls<=1?1:2), sampling_rate(spr==44100?SL_SAMPLINGRATE_44_1:SL_SAMPLINGRATE_16),
-                                              sample_rate(sampling_rate / 1000), pcm_data((uint8_t*)malloc(sizeof(uint8_t)*(PCM_BUF_SIZE))),
-                                              frm_size(1024*2*channels), frm_changed(false), cache(frm_size, channels), frame(frm_size, channels),
+                                              channels(cls<=1?1:2), sampling_rate(spr==48000?SL_SAMPLINGRATE_48:SL_SAMPLINGRATE_16),
+                                              sample_rate(sampling_rate / 1000), period_ms(perms),
+                                              // PCM Size=采样率*采样时间*采样位深/8*通道数（Bytes）
+                                              buf_size(sample_rate*(period_ms/1000.0f)*2*channels),
+                                              pcm_data((uint8_t*)malloc(sizeof(uint8_t)*(buf_size))),
                                               frame_callback(nullptr), frame_ctx(nullptr), averagedB_callback(nullptr) {
-            log_d("Audio[%d,%d] created.", channels, sample_rate);
+            log_d("Audio[%d,%d,%d] created.", channels, sample_rate, buf_size);
             initObjects();
         }
 
@@ -2135,7 +2138,7 @@ namespace x {
                 free(pcm_data);
                 pcm_data = nullptr;
             }
-            log_d("Audio[%d,%d] release.", channels, sample_rate);
+            log_d("Audio[%d,%d,%d] release.", channels, sample_rate, buf_size);
         }
 
     public:
@@ -2154,7 +2157,7 @@ namespace x {
          * start audio record
          * @return true: start success
          */
-        bool startRecord(void (*frm_callback)(void *) = nullptr,
+        bool startRecord(void (*frm_callback)(AudioFrame&&, void *) = nullptr,
                          void *ctx = nullptr,
                          void (*dB_callback)(double) = nullptr) {
             if (!recordable()) {
@@ -2170,7 +2173,7 @@ namespace x {
             frame_callback = frm_callback;
             frame_ctx = ctx;
             averagedB_callback = dB_callback;
-            log_d("Audio[%d,%d] start record.", channels, sample_rate);
+            log_d("Audio[%d,%d,%d] start record.", channels, sample_rate, buf_size);
             return true;
         }
         /**
@@ -2181,23 +2184,7 @@ namespace x {
                 return;
             }
             (*rec_eng)->SetRecordState(rec_eng, SL_RECORDSTATE_STOPPED);
-            log_d("Audio[%d,%d] stop record.", channels, sample_rate);
-        }
-        /**
-         * collect an audio frame
-         * @param changed true: audio frame data cache changed
-         * @return collect success audio_frame, all return audio_frame is same address
-         */
-        bool collectFrame(AudioFrame &frm, bool *changed = nullptr) {
-            bool chg = frm_changed;
-            if (chg) {
-                frm = frame;
-            }
-            if (changed != nullptr) {
-                *changed = frm_changed;
-            }
-            frm_changed = false;
-            return chg;
+            log_d("Audio[%d,%d,%d] stop record.", channels, sample_rate, buf_size);
         }
 
     public:
@@ -2212,29 +2199,29 @@ namespace x {
         /**
          * @return audio frame data size
          */
-        uint32_t getFrameSize() const { return frm_size; }
+        uint32_t getFrameSize() const { return buf_size; }
 
     private:
         void initObjects() {
             SLresult res;
-            SLmillisecond period;
+//            SLmillisecond period;
             res = slCreateEngine(&eng_obj, 0, nullptr, 0, nullptr, nullptr);
             if (res != SL_RESULT_SUCCESS) {
-                log_e("Audio[%d,%d] create eng obj fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] create eng obj fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
             res = (*eng_obj)->Realize(eng_obj, SL_BOOLEAN_FALSE);
             if (res != SL_RESULT_SUCCESS) {
                 (*eng_obj)->Destroy(eng_obj);
                 eng_obj = nullptr;
-                log_e("Audio[%d,%d] realize eng obj fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] realize eng obj fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
             res = (*eng_obj)->GetInterface(eng_obj, SL_IID_ENGINE, &eng_eng);
             if (res != SL_RESULT_SUCCESS) {
                 (*eng_obj)->Destroy(eng_obj);
                 eng_obj = nullptr;
-                log_e("Audio[%d,%d] get eng eng fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] get eng eng fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
             SLDataLocator_IODevice ioDevice = {
@@ -2260,7 +2247,7 @@ namespace x {
                 (*eng_obj)->Destroy(eng_obj);
                 eng_obj = nullptr;
                 eng_eng = nullptr;
-                log_e("Audio[%d,%d] create audio recorder fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] create audio recorder fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
             res = (*rec_obj)->Realize(rec_obj, SL_BOOLEAN_FALSE);
@@ -2270,7 +2257,7 @@ namespace x {
                 eng_eng = nullptr;
                 (*rec_obj)->Destroy(rec_obj);
                 rec_obj = nullptr;
-                log_e("Audio[%d,%d] realize audio recorder fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] realize audio recorder fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
             res = (*rec_obj)->GetInterface(rec_obj, SL_IID_RECORD, &rec_eng);
@@ -2280,11 +2267,11 @@ namespace x {
                 eng_eng = nullptr;
                 (*rec_obj)->Destroy(rec_obj);
                 rec_obj = nullptr;
-                log_e("Audio[%d,%d] get audio recorder fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] get audio recorder fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
-            (*rec_eng)->SetPositionUpdatePeriod(rec_eng, PERIOD_TIME);
-            (*rec_eng)->GetPositionUpdatePeriod(rec_eng, &period);
+            (*rec_eng)->SetPositionUpdatePeriod(rec_eng, period_ms);
+//            (*rec_eng)->GetPositionUpdatePeriod(rec_eng, &period);
 //            log_d("Audio[%d,%d] period millisecond: %dms", channels, sample_rate, period);
             res = (*rec_obj)->GetInterface(rec_obj, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &rec_queue);
             if (res != SL_RESULT_SUCCESS) {
@@ -2293,7 +2280,7 @@ namespace x {
                 eng_eng = nullptr;
                 (*rec_obj)->Destroy(rec_obj);
                 rec_obj = nullptr;
-                log_e("Audio[%d,%d] get audio recorder queue fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] get audio recorder queue fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
             res = (*rec_queue)->RegisterCallback(rec_queue, queueCallback, this);
@@ -2303,10 +2290,10 @@ namespace x {
                 eng_eng = nullptr;
                 (*rec_obj)->Destroy(rec_obj);
                 rec_obj = nullptr;
-                log_e("Audio[%d,%d] queue register callback fail. %d.", channels, sample_rate, res);
+                log_e("Audio[%d,%d,%d] queue register callback fail. %d.", channels, sample_rate, buf_size, res);
                 return;
             }
-//            log_d("Audio[%d,%d] init success.", channels, sample_rate);
+//            log_d("Audio[%d,%d,%d] init success.", channels, sample_rate, buf_size);
         }
 
         bool recordable() const {
@@ -2319,24 +2306,17 @@ namespace x {
             if (chk_recording && !recording()) {
                 return false;
             }
-            SLresult res = (*rec_queue)->Enqueue(rec_queue, pcm_data, PCM_BUF_SIZE);
+            SLresult res = (*rec_queue)->Enqueue(rec_queue, pcm_data, buf_size);
             return res == SL_RESULT_SUCCESS;
         }
 
     private:
         void handleFrame() {
-            if (cache.offset + PCM_BUF_SIZE > cache.size) {
-                memcpy(frame.cache, cache.cache, sizeof(uint8_t) * cache.offset);
-                int32_t c = cache.size - cache.offset;
-                memcpy(frame.cache + cache.offset, pcm_data, sizeof(uint8_t) * c);
-                frm_changed = true;
-                cache.offset = PCM_BUF_SIZE - c;
-                memcpy(cache.cache, pcm_data + c, sizeof(uint8_t) * cache.offset);
+            if (averagedB_callback != nullptr || frame_callback != nullptr) {
+                AudioFrame frame(buf_size, channels);
+                memcpy(frame.cache, pcm_data, sizeof(uint8_t) * buf_size);
                 if (averagedB_callback != nullptr) averagedB_callback(frame.averagedB());
-                if (frame_callback != nullptr) frame_callback(frame_ctx);
-            } else {
-                memcpy(cache.cache + cache.offset, pcm_data, sizeof(uint8_t) * PCM_BUF_SIZE);
-                cache.offset += PCM_BUF_SIZE;
+                if (frame_callback != nullptr) frame_callback(std::forward<AudioFrame>(frame), frame_ctx);
             }
         }
 
@@ -2354,11 +2334,6 @@ namespace x {
         Audio& operator=(const Audio&) = delete;
 
     private:
-        // PCM Size=采样率*采样时间*采样位深/8*通道数（Bytes）
-        const int32_t PERIOD_TIME  = 10;  // 10ms
-        const int32_t PCM_BUF_SIZE = 320; // 320bytes
-
-    private:
         SLObjectItf eng_obj;
         SLEngineItf eng_eng;
         SLObjectItf rec_obj;
@@ -2369,16 +2344,12 @@ namespace x {
         uint32_t channels;
         SLuint32 sampling_rate;
         uint32_t sample_rate;
+        uint32_t period_ms;
+        uint32_t buf_size;
         uint8_t *pcm_data;
 
     private:
-        uint32_t         frm_size;
-        std::atomic_bool frm_changed;
-        AudioFrame       cache;
-        AudioFrame       frame;
-
-    private:
-        void (*frame_callback)(void *);
+        void (*frame_callback)(AudioFrame&&, void *);
         void *frame_ctx;
         void (*averagedB_callback)(double);
     };
@@ -2646,15 +2617,12 @@ namespace x {
         }
 
     private:
-        static void collectAudio(void *ctx) {
+        static void collectAudio(AudioFrame&& frame, void *ctx) {
             auto *recorder = (AudioRecorder*)ctx;
             if (recorder->checkRecording != nullptr &&
                 recorder->checkRecording() &&
                 recorder->frameCompleted != nullptr) {
-                AudioFrame frame;
-                if (recorder->audio->collectFrame(frame)) {
-                    recorder->frameCompleted(std::move(frame));
-                }
+                recorder->frameCompleted(std::forward<AudioFrame>(frame));
             }
         }
 
@@ -2681,12 +2649,9 @@ namespace x {
     class EncodeWorker {
     public:
         EncodeWorker(int32_t i,
-                     std::shared_ptr<ImageQueue> &iQ,
-                     std::shared_ptr<AudioQueue> &aQ,
                      void (*callback)(VideoEncoder&, int32_t),
-                     VideoEncoder &en):
-                        id(i), imgQ(iQ), audQ(aQ), exited(false),
-                        completeCallback(callback), encoder(en) {
+                     VideoEncoder &en): id(i), exited(false),
+                                        completeCallback(callback), encoder(en) {
             struct timeval tv{};
             gettimeofday(&tv, nullptr);
             _time = tv.tv_sec * 1000 + tv.tv_usec / 1000;
@@ -2704,19 +2669,21 @@ namespace x {
 
     public:
         static void encodeRunnable(const std::shared_ptr<EncodeWorker>& worker,
+                                   const std::shared_ptr<ImageQueue> &imgQ,
+                                   const std::shared_ptr<AudioQueue> &audQ,
                                    const std::shared_ptr<std::atomic_bool>& runnable) {
             log_d("EncodeWorker[%d@%ld] encode thread start.", worker->id, worker->_time);
-            while(*runnable || worker->imgQ->size_approx() > 0 || worker->audQ->size_approx() > 0) {
+            while(*runnable || imgQ->size_approx() > 0 || audQ->size_approx() > 0) {
                 if (worker->exited) {
                     break;
                 }
                 bool ok = false;
                 ImageFrame img;
-                worker->imgQ->try_dequeue(img);
-                ok |= encodeImageFrame(worker, std::move(img));
+                imgQ->try_dequeue(img);
+                ok |= encodeImageFrame(worker, std::forward<ImageFrame>(img));
                 AudioFrame aud;
-                worker->audQ->try_dequeue(aud);
-                ok |= encodeAudioFrame(worker, std::move(aud));
+                audQ->try_dequeue(aud);
+                ok |= encodeAudioFrame(worker, std::forward<AudioFrame>(aud));
                 if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             log_d("EncodeWorker[%d@%ld] encode thread exit.", worker->id, worker->_time);
@@ -2737,7 +2704,7 @@ namespace x {
         static bool encodeAudioFrame(const std::shared_ptr<EncodeWorker>& worker, AudioFrame &&frame) {
             if (frame.available()) {
                 // TODO: DEBUG
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                std::this_thread::sleep_for(std::chrono::microseconds(5));
                 return true;
             } else {
                 return false;
@@ -2755,8 +2722,6 @@ namespace x {
 
     private:
         int32_t                     id;
-        std::shared_ptr<ImageQueue> imgQ;
-        std::shared_ptr<AudioQueue> audQ;
         std::atomic_bool            exited;
 
     private:
@@ -2811,11 +2776,9 @@ namespace x {
             log_d("VideoEncoder started: %s.", name.c_str());
             encodeRunnable = std::make_shared<std::atomic_bool>(true);
             int32_t id = workers.size();
-            workers[id] = std::make_shared<EncodeWorker>(id, imgQ, audQ,
-                                                         VideoEncoder::onEncodeWorkerCompleted,
-                                                         *this);
+            workers[id] = std::make_shared<EncodeWorker>(id, VideoEncoder::onEncodeWorkerCompleted, *this);
             for (const auto& worker : workers) {
-                std::thread et(EncodeWorker::encodeRunnable, worker.second, encodeRunnable);
+                std::thread et(EncodeWorker::encodeRunnable, worker.second, imgQ, audQ, encodeRunnable);
                 et.detach();
             }
         }
