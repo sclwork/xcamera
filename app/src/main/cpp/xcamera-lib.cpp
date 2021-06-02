@@ -30,6 +30,21 @@
 #include <MNN/Tensor.hpp>
 #include <MNN/ImageProcess.hpp>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <libavcodec/avcodec.h>
+#include <libavdevice/avdevice.h>
+#include <libavfilter/avfilter.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
+#include <libpostproc/postprocess.h>
+#ifdef __cplusplus
+}
+#endif
+
 #define log_d(...)  __android_log_print(ANDROID_LOG_DEBUG, "xcamera", __VA_ARGS__)
 #define log_e(...)  __android_log_print(ANDROID_LOG_ERROR, "xcamera", __VA_ARGS__)
 
@@ -45,9 +60,34 @@ namespace x {
      *
      */
     typedef struct image_args {
+        image_args(): width(0), height(0), channels(0), fps(0), frame_size(0) {}
         image_args(uint32_t w, uint32_t h, uint32_t c, uint32_t f)
                 :width(w), height(h), channels(c), fps(f) { frame_size = width*height*channels; }
+        image_args(image_args &&args) noexcept
+                :width(args.width), height(args.height), channels(args.channels),
+                 fps(args.fps), frame_size(args.frame_size) {}
+        image_args(const image_args &args) noexcept
+                :width(args.width), height(args.height), channels(args.channels),
+                 fps(args.fps), frame_size(args.frame_size) {}
+        image_args& operator=(image_args &&args) noexcept {
+            width = args.width;
+            height = args.height;
+            channels = args.channels;
+            fps = args.fps;
+            frame_size = args.frame_size;
+            return *this;
+        }
+        image_args& operator=(const image_args &args) noexcept {
+            width = args.width;
+            height = args.height;
+            channels = args.channels;
+            fps = args.fps;
+            frame_size = args.frame_size;
+            return *this;
+        }
         uint32_t width, height, channels, fps, frame_size;
+        void print() const { log_d("ImageArgs: w(%d), h(%d), c(%d), f(%d), s(%d).",
+                                   width, height, channels, fps, frame_size); }
     } image_args;
 
 
@@ -55,9 +95,30 @@ namespace x {
      *
      */
     typedef struct audio_args {
+        audio_args(): channels(0), sample_rate(0), frame_size(0) {}
         audio_args(uint32_t c, uint32_t s, uint32_t f)
                 :channels(c), sample_rate(s), frame_size(f) {}
+        audio_args(audio_args &&args) noexcept
+                :channels(args.channels), sample_rate(args.sample_rate),
+                 frame_size(args.frame_size) {}
+        audio_args(const audio_args &args) noexcept
+                :channels(args.channels), sample_rate(args.sample_rate),
+                 frame_size(args.frame_size) {}
+        audio_args& operator=(audio_args &&args) noexcept {
+            channels = args.channels;
+            sample_rate = args.sample_rate;
+            frame_size = args.frame_size;
+            return *this;
+        }
+        audio_args& operator=(const audio_args &args) noexcept {
+            channels = args.channels;
+            sample_rate = args.sample_rate;
+            frame_size = args.frame_size;
+            return *this;
+        }
         uint32_t channels, sample_rate, frame_size;
+        void print() const { log_d("AudioArgs: c(%d), sr(%d), s(%d).",
+                                   channels, sample_rate, frame_size); }
     } audio_args;
 
 
@@ -761,6 +822,490 @@ namespace x {
         Kalman fKmFaceCX, fKmFaceCX2;
         Kalman fKmFaceCY, fKmFaceCY2;
         double fTpFaceCX, fTpFaceCY;
+    };
+
+
+    /*
+     *
+     */
+    class H264 {
+    public:
+        H264(std::string &n,
+             image_args &img,
+             audio_args &aud): name(n), image(img), audio(aud),
+                               vf_ctx(nullptr), ic_ctx(nullptr), i_stm(nullptr),
+                               i_sws_ctx(nullptr), i_rgb_frm(nullptr), i_yuv_frm(nullptr),
+                               ac_ctx(nullptr), a_stm(nullptr), a_swr_ctx(nullptr), a_frm(nullptr),
+                               i_h264bsfc(av_bitstream_filter_init("h264_mp4toannexb")),
+                               a_aac_adtstoasc(av_bitstream_filter_init("aac_adtstoasc")),
+                               i_pts(0), a_pts(0), a_encode_offset(0), a_encode_length(0), a_encode_cache(nullptr) {
+            log_d("H264[%s] created.", name.c_str());
+            image.print();
+            audio.print();
+            av_register_all();
+            avcodec_register_all();
+            std::remove(name.c_str());
+            fclose(fopen(name.c_str(), "wb+"));
+            init("", name);
+        }
+
+        ~H264() {
+            release();
+            log_d("H264[%s] release.", name.c_str());
+        }
+
+    public:
+        bool encodeImage(ImageFrame &&frame) {
+            if (vf_ctx != nullptr && frame.available()) {
+                encodeImageCtx();
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        bool encodeAudio(AudioFrame &&frame) {
+            if (vf_ctx != nullptr && frame.available()) {
+                int32_t size = 0;
+                uint8_t *data = nullptr;
+                frame.get(&size, &data);
+                if (size <= 0 || data == nullptr) {
+                    return false;
+                }
+                if (a_encode_offset + size >= a_encode_length) {
+                    int32_t count = a_encode_length - a_encode_offset;
+                    memcpy(a_encode_cache + a_encode_offset, data, sizeof(uint8_t) * count);
+                    encodeAudioCtx();
+                    int32_t data_offset = count;
+                    count = size - count;
+                    if (count > 0) {
+                        memcpy(a_encode_cache, data + data_offset, sizeof(uint8_t) * count);
+                        a_encode_offset += count;
+                    }
+                } else {
+                    memcpy(a_encode_cache + a_encode_offset, data, sizeof(uint8_t) * size);
+                    a_encode_offset += size;
+                }
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        void complete() {
+            flushImageCtx();
+            flushAudioCtx();
+            if (vf_ctx != nullptr) {
+                av_write_trailer(vf_ctx);
+                avio_closep(&vf_ctx->pb);
+            }
+            release();
+        }
+
+    private:
+        void init(const std::string &format, const std::string &file_name) {
+            int32_t res = avformat_alloc_output_context2(&vf_ctx, nullptr,
+                                                         format.length()<=0?nullptr:(format.c_str()),
+                                                         file_name.c_str());
+            if (res < 0) {
+                log_e("H264[%s] avformat_alloc_output_context2 fail[%d].", name.c_str(), res);
+                release();
+                return;
+            }
+
+            if (!initImageCtx()) {
+                return;
+            }
+
+            if (!initAudioCtx()) {
+                return;
+            }
+
+            AVOutputFormat *ofmt = vf_ctx->oformat;
+            log_d("H264[%s] vf_ctx oformat name: %s, acodec: %s, vcodec: %s.", name.c_str(),
+                  ofmt->long_name, avcodec_get_name(ofmt->audio_codec), avcodec_get_name(ofmt->video_codec));
+
+            res = avio_open(&vf_ctx->pb, file_name.c_str(), AVIO_FLAG_WRITE);
+            if (res < 0) {
+                char err[64];
+                av_strerror(res, err, 64);
+                log_e("H264[%s] avio_open fail: (%d) %s", name.c_str(), res, err);
+                release();
+                return;
+            }
+
+            res = avformat_write_header(vf_ctx, nullptr);
+            if (res < 0) {
+                char err[64];
+                av_strerror(res, err, 64);
+                log_e("H264[%s] avformat_write_header fail: (%d) %s", name.c_str(), res, err);
+                release();
+                return;
+            }
+            log_d("H264[%s] init_video_encode vf_ctx stream num: %d.", name.c_str(), vf_ctx->nb_streams);
+        }
+
+        bool initImageCtx() {
+            AVCodec *i_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+            if (i_codec == nullptr) {
+                log_e("H264[%s] image avcodec_find_encoder fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            log_d("H264[%s] image video_codec: %s.", name.c_str(), i_codec->long_name);
+            ic_ctx = avcodec_alloc_context3(i_codec);
+            if (ic_ctx == nullptr) {
+                log_e("H264[%s] image avcodec_alloc_context3 fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            ic_ctx->codec_id = i_codec->id;
+            ic_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+            ic_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+            ic_ctx->width = image.width;
+            ic_ctx->height = image.height;
+            ic_ctx->time_base = {1, image.fps<=0?30:(int32_t)image.fps};
+            ic_ctx->bit_rate = 64000;
+            ic_ctx->gop_size = 10;
+            ic_ctx->qmin = 10;
+            ic_ctx->qmax = 51;
+            ic_ctx->max_b_frames = 3;
+            ic_ctx->qcompress = 0.6;
+            ic_ctx->max_qdiff = 4;
+            ic_ctx->i_quant_factor = 0.71;
+            ic_ctx->keyint_min = 25;
+            if (vf_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+                ic_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            }
+
+            AVDictionary *options = nullptr;
+            if (ic_ctx->codec_id == AV_CODEC_ID_H264) {
+                av_dict_set(&options, "preset", "superfast", 0);
+                av_dict_set(&options, "tune", "zerolatency", 0);
+            }
+
+            int32_t res = avcodec_open2(ic_ctx, i_codec, &options);
+            if (res < 0) {
+                log_e("H264[%s] image avcodec_open2 fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_stm = avformat_new_stream(vf_ctx, i_codec);
+            if (i_stm == nullptr) {
+                log_e("H264[%s] image avformat_new_stream fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_stm->id = vf_ctx->nb_streams - 1;
+            i_stm->time_base = {1, image.fps<=0?30:(int32_t)image.fps};
+            i_stm->codec->time_base = {1, image.fps<=0?30:(int32_t)image.fps};
+            i_stm->codec->codec_tag = 0;
+            if (vf_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+                i_stm->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            }
+
+            res = avcodec_parameters_from_context(i_stm->codecpar, ic_ctx);
+            if (res < 0) {
+                log_e("H264[%s] image avcodec_parameters_from_context fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_sws_ctx = sws_getContext(image.width, image.height, AV_PIX_FMT_RGBA,
+                                       image.width, image.height, AV_PIX_FMT_YUV420P,
+                                       SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (i_sws_ctx == nullptr) {
+                log_e("H264[%s] image sws_getContext fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_rgb_frm = av_frame_alloc();
+            if (i_rgb_frm == nullptr) {
+                log_e("H264[%s] image av_frame_alloc fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_rgb_frm->format = AV_PIX_FMT_RGBA;
+            i_rgb_frm->width = image.width;
+            i_rgb_frm->height = image.height;
+
+            res = av_frame_get_buffer(i_rgb_frm, 0);
+            if (res < 0) {
+                log_e("H264[%s] image av_frame_get_buffer fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            res = av_frame_make_writable(i_rgb_frm);
+            if (res < 0) {
+                log_e("H264[%s] image av_frame_make_writable fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_yuv_frm = av_frame_alloc();
+            if (i_yuv_frm == nullptr) {
+                log_e("H264[%s] image av_frame_alloc fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_yuv_frm->format = AV_PIX_FMT_YUV420P;
+            i_yuv_frm->width = image.width;
+            i_yuv_frm->height = image.height;
+
+            res = av_frame_get_buffer(i_yuv_frm, 0);
+            if (res < 0) {
+                log_e("H264[%s] image av_frame_get_buffer fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            res = av_frame_make_writable(i_yuv_frm);
+            if (res < 0) {
+                log_e("H264[%s] image av_frame_make_writable fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            i_pts = 0;
+            log_d("H264[%s] init_image_encode success.", name.c_str());
+            return true;
+        }
+
+        bool initAudioCtx() {
+            AVCodec *a_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+            if (a_codec == nullptr) {
+                log_e("H264[%s] audio avcodec_find_encoder fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            log_d("H264[%s] audio audio_codec: %s.", name.c_str(), a_codec->long_name);
+            ac_ctx = avcodec_alloc_context3(a_codec);
+            if (ac_ctx == nullptr) {
+                log_e("H264[%s] audio avcodec_alloc_context3 fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            ac_ctx->codec_id = a_codec->id;
+            ac_ctx->codec_type = AVMEDIA_TYPE_AUDIO;
+            ac_ctx->bit_rate = 64000;
+            ac_ctx->sample_rate = audio.sample_rate;
+            ac_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+            ac_ctx->channels = audio.channels;
+            ac_ctx->channel_layout = av_get_default_channel_layout(audio.channels);
+            ac_ctx->time_base = {1, (int32_t)audio.sample_rate };
+            if (vf_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+                ac_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            }
+
+            int32_t res = avcodec_open2(ac_ctx, a_codec, nullptr);
+            if (res < 0) {
+                log_e("H264[%s] audio avcodec_open2 fail: %d.", name.c_str(), res);
+                release();
+                return false;
+            }
+
+            a_stm = avformat_new_stream(vf_ctx, a_codec);
+            if (a_stm == nullptr) {
+                log_e("H264[%s] audio avformat_new_stream fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            a_stm->id = vf_ctx->nb_streams - 1;
+            a_stm->time_base = {1, (int32_t)audio.sample_rate };
+            a_stm->codec->time_base = {1, (int32_t)audio.sample_rate };
+            a_stm->codec->codec_tag = 0;
+            if (vf_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+                a_stm->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            }
+
+            res = avcodec_parameters_from_context(a_stm->codecpar, ac_ctx);
+            if (res < 0) {
+                log_e("H264[%s] audio avcodec_parameters_from_context fail: %d.", name.c_str(), res);
+                release();
+                return false;
+            }
+
+            a_frm = av_frame_alloc();
+            if (a_frm == nullptr) {
+                log_e("H264[%s] audio av_frame_alloc fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            int32_t nb_samples;
+            if (ac_ctx->codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE) {
+                nb_samples = 1024;
+            } else {
+                nb_samples = ac_ctx->frame_size;
+            }
+            log_d("H264[%s] audio nb samples: %d", name.c_str(), nb_samples);
+            a_frm->nb_samples = nb_samples;
+            a_frm->format = ac_ctx->sample_fmt;
+            a_frm->channel_layout = ac_ctx->channel_layout;
+
+            res = av_frame_get_buffer(a_frm, 0);
+            if (res < 0) {
+                log_e("H264[%s] audio av_frame_get_buffer fail: %d.", name.c_str(), res);
+                release();
+                return false;
+            }
+
+            res = av_frame_make_writable(a_frm);
+            if (res < 0) {
+                log_e("H264[%s] audio av_frame_make_writable fail: %d.", name.c_str(), res);
+                release();
+                return false;
+            }
+
+            a_swr_ctx = swr_alloc_set_opts(nullptr, a_frm->channel_layout,
+                                           ac_ctx->sample_fmt, audio.sample_rate, a_frm->channel_layout,
+                                           AV_SAMPLE_FMT_S16, audio.sample_rate, 0, nullptr);
+            if (a_swr_ctx == nullptr) {
+                log_e("H264[%s] audio swr_alloc_set_opts fail.", name.c_str());
+                release();
+                return false;
+            }
+
+            res = swr_init(a_swr_ctx);
+            if (res < 0) {
+                char err[64];
+                av_strerror(res, err, 64);
+                log_e("H264[%s] audio swr_init fail: (%d) %s", name.c_str(), res, err);
+                release();
+                return false;
+            }
+
+            a_pts = 0;
+            a_encode_offset = 0;
+            a_encode_length = a_frm->linesize[0];
+            a_encode_cache = (uint8_t *) malloc(sizeof(uint8_t) * a_encode_length);
+            log_d("H264[%s] init_audio_encode success. frame size:%d.", name.c_str(), a_encode_length);
+            return true;
+        }
+
+        void encodeImageCtx() {
+        }
+
+        void encodeAudioCtx() {
+            uint8_t *pData[1] = { a_encode_cache };
+            if (swr_convert(a_swr_ctx, a_frm->data, a_frm->nb_samples,
+                            (const uint8_t **)pData, a_frm->nb_samples) >= 0) {
+                a_frm->pts = a_pts;
+                a_pts += a_frm->nb_samples;
+                int32_t res = avcodec_send_frame(ac_ctx, a_frm);
+                if (res < 0) {
+                    char err[64];
+                    av_strerror(res, err, 64);
+                    log_e("H264[%s] audio avcodec_send_frame fail[%d]%s.", name.c_str(), res, err);
+                    return;
+                }
+                receiveAudioPacket();
+            }
+            memset(a_encode_cache, 0, sizeof(uint8_t) * a_encode_length);
+            a_encode_offset = 0;
+        }
+
+        void flushImageCtx() {
+        }
+
+        void flushAudioCtx() {
+            if (a_encode_offset > 0) { encodeAudioCtx(); }
+            int32_t res = avcodec_send_frame(ac_ctx, nullptr);
+            if (res < 0) {
+                char err[64];
+                av_strerror(res, err, 64);
+                log_e("H264[%s] audio avcodec_send_frame fail[%d]%s.", name.c_str(), res, err);
+                return;
+            }
+            receiveAudioPacket();
+        }
+
+        void receiveImagePacket() {
+        }
+
+        void receiveAudioPacket() {
+            while (true) {
+                AVPacket *pkt = av_packet_alloc();
+                if (pkt == nullptr) {
+                    log_e("H264[%s] audio av_packet_alloc fail.", name.c_str());
+                    break;
+                }
+                av_init_packet(pkt);
+                if (avcodec_receive_packet(ac_ctx, pkt) < 0) {
+                    av_packet_free(&pkt);
+                    break;
+                }
+                av_packet_rescale_ts(pkt, a_stm->codec->time_base, a_stm->time_base);
+                pkt->stream_index = a_stm->index;
+                av_interleaved_write_frame(vf_ctx, pkt);
+                av_packet_free(&pkt);
+            }
+        }
+
+        void release() {
+            if (i_sws_ctx != nullptr) sws_freeContext(i_sws_ctx);
+            i_sws_ctx = nullptr;
+            if (i_rgb_frm != nullptr) av_frame_free(&i_rgb_frm);
+            i_rgb_frm = nullptr;
+            if (i_yuv_frm != nullptr) av_frame_free(&i_yuv_frm);
+            i_yuv_frm = nullptr;
+            if (ic_ctx != nullptr) avcodec_close(ic_ctx);
+            if (ic_ctx != nullptr) avcodec_free_context(&ic_ctx);
+            ic_ctx = nullptr;
+
+            if (a_swr_ctx != nullptr) swr_free(&a_swr_ctx);
+            a_swr_ctx = nullptr;
+            if (a_frm != nullptr) av_frame_free(&a_frm);
+            a_frm = nullptr;
+            if (ac_ctx != nullptr) avcodec_close(ac_ctx);
+            if (ac_ctx != nullptr) avcodec_free_context(&ac_ctx);
+            ac_ctx = nullptr;
+
+            if (vf_ctx != nullptr) avformat_free_context(vf_ctx);
+            vf_ctx = nullptr;
+        }
+
+    private:
+        H264(H264&&) = delete;
+        H264(const H264&) = delete;
+        H264& operator=(H264&&) = delete;
+        H264& operator=(const H264&) = delete;
+
+    private:
+        std::string name;
+        image_args  image;
+        audio_args  audio;
+
+    private:
+        AVFormatContext          *vf_ctx;
+        AVCodecContext           *ic_ctx;
+        AVStream                 *i_stm;
+        SwsContext               *i_sws_ctx;
+        AVFrame                  *i_rgb_frm;
+        AVFrame                  *i_yuv_frm;
+        AVCodecContext           *ac_ctx;
+        AVStream                 *a_stm;
+        SwrContext               *a_swr_ctx;
+        AVFrame                  *a_frm;
+        AVBitStreamFilterContext *i_h264bsfc;
+        AVBitStreamFilterContext *a_aac_adtstoasc;
+
+    private:
+        int32_t  i_pts, a_pts;
+        int32_t  a_encode_offset;
+        int32_t  a_encode_length;
+        uint8_t *a_encode_cache;
     };
 
 
@@ -2366,7 +2911,7 @@ namespace x {
                                 std::vector<std::shared_ptr<Camera>> &cms,
                                 int32_t width, int32_t height):
                                     cams(cns), cameras(cms), camFrames(),
-                                    camWidth(width/2), camHeight(height/2) {
+                                    camWidth(width), camHeight(height) {
             log_d("ImageCollector[%s] created.", cams.c_str());
             for (auto& camFrame : camFrames) { camFrame.reset(); }
             std::vector<std::shared_ptr<ImageFrame>> ef; camFrames.swap(ef);
@@ -2388,7 +2933,7 @@ namespace x {
     public:
         static void collectRunnable(const std::shared_ptr<ImageCollector>& collector,
                                     const std::shared_ptr<std::atomic_bool>& runnable,
-                                    const CameraMerge merge) {
+                                    const CameraMerge merge, int32_t *out_fps) {
             log_d("ImageCollector[%s] collect thread start.", collector->cams.c_str());
             int32_t fps = 0;
             if (merge == CameraMerge::Single) {
@@ -2404,6 +2949,7 @@ namespace x {
                 }
             }
             fps = fps <= 0 ? 30 : fps;
+            if (out_fps != nullptr) *out_fps = fps;
             auto fps_ms = (int32_t)(1000.0f / fps);
             long ms;
             struct timeval tv{};
@@ -2521,7 +3067,7 @@ namespace x {
     public:
         explicit ImageRecorder(const std::string &&cms): cams(cms),
                                                          collectRunnable(std::make_shared<std::atomic_bool>(false)),
-                                                         collector() {
+                                                         collector(), width(0), height(0), fps(0) {
             log_d("ImageRecorder[%s] created.", cams.c_str());
             std::regex re{ "," };
             std::vector<std::string> ids {
@@ -2536,6 +3082,11 @@ namespace x {
             for (auto& camera : cameras) { camera->close();camera.reset(); }
             std::vector<std::shared_ptr<Camera>> ec; cameras.swap(ec);
             log_d("ImageRecorder[%s] release.", cams.c_str());
+        }
+
+    public:
+        void getImageArgs(image_args &img) const {
+            img = image_args(width, height, 4, fps);
         }
 
     public:
@@ -2559,11 +3110,12 @@ namespace x {
         }
 
     public:
-        void start(int32_t width, int32_t height, CameraMerge merge) {
+        void start(int32_t w, int32_t h, CameraMerge merge) {
             if (*collectRunnable) return;
+            width = w; height = h;
             collectRunnable = std::make_shared<std::atomic_bool>(true);
             collector = std::make_shared<ImageCollector>(cams, cameras, width, height);
-            std::thread ct(ImageCollector::collectRunnable, collector, collectRunnable, merge);
+            std::thread ct(ImageCollector::collectRunnable, collector, collectRunnable, merge, &fps);
             ct.detach();
         }
 
@@ -2585,6 +3137,9 @@ namespace x {
         std::vector<std::shared_ptr<Camera>>     cameras;
         std::shared_ptr<std::atomic_bool>        collectRunnable;
         std::shared_ptr<ImageCollector>          collector;
+
+    private:
+        int32_t width, height, fps;
     };
 
 
@@ -2606,6 +3161,13 @@ namespace x {
         ~AudioRecorder() {
             audio.reset();
             log_d("AudioRecorder release.");
+        }
+
+    public:
+        void getAudioArgs(audio_args &aud) const {
+            aud = audio_args(audio->getChannels(),
+                             audio->getSampleRate(),
+                             audio->getFrameSize());
         }
 
     public:
@@ -2671,6 +3233,7 @@ namespace x {
 
     public:
         static void encodeRunnable(const std::shared_ptr<EncodeWorker>& worker,
+                                   const std::shared_ptr<H264> &h264,
                                    const std::shared_ptr<ImageQueue> &imgQ,
                                    const std::shared_ptr<AudioQueue> &audQ,
                                    const std::shared_ptr<std::atomic_bool>& runnable) {
@@ -2682,35 +3245,14 @@ namespace x {
                 bool ok = false;
                 ImageFrame img;
                 imgQ->try_dequeue(img);
-                ok |= encodeImageFrame(worker, std::forward<ImageFrame>(img));
+                ok |= !(h264 == nullptr) && h264->encodeImage(std::forward<ImageFrame>(img));
                 AudioFrame aud;
                 audQ->try_dequeue(aud);
-                ok |= encodeAudioFrame(worker, std::forward<AudioFrame>(aud));
-                if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ok |= !(h264 == nullptr) && h264->encodeAudio(std::forward<AudioFrame>(aud));
+                if (!ok) std::this_thread::sleep_for(std::chrono::microseconds (1));
             }
             log_d("EncodeWorker[%d@%ld] encode thread exit.", worker->id, worker->_time);
             if (!worker->exited)worker->completeCallback(worker->encoder, worker->id);
-        }
-
-    private:
-        static bool encodeImageFrame(const std::shared_ptr<EncodeWorker>& worker, ImageFrame &&frame) {
-            if (frame.available()) {
-                // TODO: DEBUG
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                return true;
-            } else {
-                return false;
-            }
-        }
-
-        static bool encodeAudioFrame(const std::shared_ptr<EncodeWorker>& worker, AudioFrame &&frame) {
-            if (frame.available()) {
-                // TODO: DEBUG
-                std::this_thread::sleep_for(std::chrono::microseconds(5));
-                return true;
-            } else {
-                return false;
-            }
         }
 
     private:
@@ -2741,7 +3283,7 @@ namespace x {
                         imgQ(std::make_shared<ImageQueue>()),
                         audQ(std::make_shared<AudioQueue>()),
                         encodeRunnable(std::make_shared<std::atomic_bool>(false)),
-                        workers(), imgPts(0), audPts(0) {
+                        workers(), imgPts(0), audPts(0), h264(nullptr) {
             log_d("VideoEncoder created.");
         }
 
@@ -2766,7 +3308,7 @@ namespace x {
         }
 
     public:
-        void start(std::string &&nme) {
+        void start(std::string &&nme, image_args &img, audio_args &aud) {
             if (*encodeRunnable) {
                 log_e("VideoEncoder running - %s.", name.c_str());
                 return;
@@ -2776,11 +3318,13 @@ namespace x {
             for (auto& worker : workers) { worker.second->exit();worker.second.reset(); }
             workers.clear();
             log_d("VideoEncoder started: %s.", name.c_str());
+            h264 = std::make_shared<H264>(name, img, aud);
             encodeRunnable = std::make_shared<std::atomic_bool>(true);
             int32_t id = workers.size();
             workers[id] = std::make_shared<EncodeWorker>(id, VideoEncoder::onEncodeWorkerCompleted, *this);
             for (const auto& worker : workers) {
-                std::thread et(EncodeWorker::encodeRunnable, worker.second, imgQ, audQ, encodeRunnable);
+                std::thread et(EncodeWorker::encodeRunnable,
+                               worker.second, h264, imgQ, audQ, encodeRunnable);
                 et.detach();
             }
         }
@@ -2794,6 +3338,8 @@ namespace x {
 
     private:
         void completed() {
+            if (h264 != nullptr) h264->complete();
+            h264.reset();
             log_d("VideoEncoder stopped: %s.", name.c_str());
         }
 
@@ -2822,6 +3368,7 @@ namespace x {
             clearImageQ(); clearAudioQ();
             for (auto& worker : workers) { worker.second->exit();worker.second.reset(); }
             workers.clear();
+            h264.reset();
         }
 
     private:
@@ -2837,6 +3384,9 @@ namespace x {
         std::shared_ptr<std::atomic_bool>                encodeRunnable;
         std::map<int32_t, std::shared_ptr<EncodeWorker>> workers;
         std::atomic_uint64_t                             imgPts, audPts;
+
+    private:
+        std::shared_ptr<H264> h264;
     };
 } // namespace x
 
@@ -3120,8 +3670,14 @@ Java_com_scliang_x_camera_CameraManager_jniRecordStart(
 JNIEnv *env, jobject thiz,
 jstring name) {
     const char *nme = env->GetStringUTFChars(name, nullptr);
-    if (g_Encoder != nullptr) {
-        g_Encoder->start(std::string(nme));
+    if (g_Encoder != nullptr &&
+        g_ImageRecorder != nullptr &&
+        g_AudioRecorder != nullptr) {
+        x::image_args img;
+        g_ImageRecorder->getImageArgs(img);
+        x::audio_args aud;
+        g_AudioRecorder->getAudioArgs(aud);
+        g_Encoder->start(std::string(nme), img, aud);
         g_Recording = true;
     }
     env->ReleaseStringUTFChars(name, nme);
