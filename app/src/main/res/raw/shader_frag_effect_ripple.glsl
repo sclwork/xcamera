@@ -5,6 +5,7 @@ layout(location = 0) out vec4 outColor;
 uniform sampler2D s_Texture;
 uniform vec2 u_TexSize;
 uniform float u_dB;
+uniform float u_MaxdB;
 uniform int u_FaceCount;
 uniform vec4 u_FaceRect;
 uniform float u_Time;
@@ -21,7 +22,7 @@ vec4 mix_audio_color(vec4 tColor) {
     const float bands = 1.0; const float segs = 60.0;
     vec2 p = vec2(floor(uv.x * bands) / bands, floor(uv.y * segs) / segs);
     // read frequency data from first row of texture
-    float fft  = (46.0 + u_dB) / 46.0;
+    float fft  = (u_MaxdB + u_dB) / u_MaxdB;
     // led color
     vec3 color = mix(vec3(0.0, 2.0, 0.0), vec3(2.0, 0.0, 0.0), sqrt(uv.y));
     // mask for bar graph

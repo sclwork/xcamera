@@ -960,6 +960,7 @@ namespace x {
         void setupProgramArgs(GLuint prog, int32_t width, int32_t height, bool mirror, const ImageFrame &frame) {
             GlUtils::setVec2(prog, "u_TexSize", glm::vec2(width, height));
             GlUtils::setBool(prog, "u_Mirror", mirror);
+            GlUtils::setFloat(prog, "u_MaxdB", 46.0f);
             GlUtils::setFloat(prog, "u_dB", frame.tmpdB / 1000.0f);
 
             if (effect == "FACE") {
@@ -2112,15 +2113,16 @@ namespace x {
     class Audio {
     public:
         explicit Audio(uint32_t cls = 2,
-                       uint32_t spr = 48000,
+                       uint32_t spr = 64000,
                        uint32_t perms = 1): eng_obj(nullptr), eng_eng(nullptr),
-                                              rec_obj(nullptr), rec_eng(nullptr), rec_queue(nullptr),
-                                              channels(cls<=1?1:2), sampling_rate(spr==48000?SL_SAMPLINGRATE_48:SL_SAMPLINGRATE_16),
-                                              sample_rate(sampling_rate / 1000), period_ms(perms),
-                                              // PCM Size=采样率*采样时间*采样位深/8*通道数（Bytes）
-                                              buf_size(sample_rate*(period_ms/1000.0f)*2*channels),
-                                              pcm_data((uint8_t*)malloc(sizeof(uint8_t)*(buf_size))),
-                                              frame_callback(nullptr), frame_ctx(nullptr), averagedB_callback(nullptr) {
+                                            rec_obj(nullptr), rec_eng(nullptr), rec_queue(nullptr),
+                                            channels(cls<=1?1:2),
+                                            sampling_rate(spr==64000?SL_SAMPLINGRATE_64:SL_SAMPLINGRATE_16),
+                                            sample_rate(sampling_rate / 1000), period_ms(perms),
+                                            // PCM Size=采样率*采样时间*采样位深/8*通道数（Bytes）
+                                            buf_size(sample_rate*(period_ms/1000.0f)*2*channels),
+                                            pcm_data((uint8_t*)malloc(sizeof(uint8_t)*(buf_size))),
+                                            frame_callback(nullptr), frame_ctx(nullptr), averagedB_callback(nullptr) {
             log_d("Audio[%d,%d,%d] created.", channels, sample_rate, buf_size);
             initObjects();
         }
