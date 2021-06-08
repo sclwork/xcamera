@@ -60,20 +60,21 @@ namespace x {
      *
      */
     typedef struct image_args {
-        image_args(): width(0), height(0), channels(0), fps(0), frame_size(0) {}
-        image_args(uint32_t w, uint32_t h, uint32_t c, uint32_t f)
-                :width(w), height(h), channels(c), fps(f) { frame_size = width*height*channels; }
+        image_args(): width(0), height(0), channels(0), fps(0), bit_rate(0), frame_size(0) {}
+        image_args(uint32_t w, uint32_t h, uint32_t c, uint32_t f, uint32_t b)
+                :width(w), height(h), channels(c), fps(f), bit_rate(b) { frame_size = width*height*channels; }
         image_args(image_args &&args) noexcept
                 :width(args.width), height(args.height), channels(args.channels),
-                 fps(args.fps), frame_size(args.frame_size) {}
+                 fps(args.fps), bit_rate(args.bit_rate), frame_size(args.frame_size) {}
         image_args(const image_args &args) noexcept
                 :width(args.width), height(args.height), channels(args.channels),
-                 fps(args.fps), frame_size(args.frame_size) {}
+                 fps(args.fps), bit_rate(args.bit_rate), frame_size(args.frame_size) {}
         image_args& operator=(image_args &&args) noexcept {
             width = args.width;
             height = args.height;
             channels = args.channels;
             fps = args.fps;
+            bit_rate = args.bit_rate;
             frame_size = args.frame_size;
             return *this;
         }
@@ -82,10 +83,11 @@ namespace x {
             height = args.height;
             channels = args.channels;
             fps = args.fps;
+            bit_rate = args.bit_rate;
             frame_size = args.frame_size;
             return *this;
         }
-        uint32_t width, height, channels, fps, frame_size;
+        uint32_t width, height, channels, fps, bit_rate, frame_size;
         void print() const { log_d("ImageArgs: w(%d), h(%d), c(%d), f(%d), s(%d).",
                                    width, height, channels, fps, frame_size); }
     } image_args;
@@ -95,28 +97,30 @@ namespace x {
      *
      */
     typedef struct audio_args {
-        audio_args(): channels(0), sample_rate(0), frame_size(0) {}
-        audio_args(uint32_t c, uint32_t s, uint32_t f)
-                :channels(c), sample_rate(s), frame_size(f) {}
+        audio_args(): channels(0), sample_rate(0), frame_size(0), bit_rate(0) {}
+        audio_args(uint32_t c, uint32_t s, uint32_t f, uint32_t b)
+                :channels(c), sample_rate(s), frame_size(f), bit_rate(b) {}
         audio_args(audio_args &&args) noexcept
                 :channels(args.channels), sample_rate(args.sample_rate),
-                 frame_size(args.frame_size) {}
+                 frame_size(args.frame_size), bit_rate(args.bit_rate) {}
         audio_args(const audio_args &args) noexcept
                 :channels(args.channels), sample_rate(args.sample_rate),
-                 frame_size(args.frame_size) {}
+                 frame_size(args.frame_size), bit_rate(args.bit_rate) {}
         audio_args& operator=(audio_args &&args) noexcept {
             channels = args.channels;
             sample_rate = args.sample_rate;
             frame_size = args.frame_size;
+            bit_rate = args.bit_rate;
             return *this;
         }
         audio_args& operator=(const audio_args &args) noexcept {
             channels = args.channels;
             sample_rate = args.sample_rate;
             frame_size = args.frame_size;
+            bit_rate = args.bit_rate;
             return *this;
         }
-        uint32_t channels, sample_rate, frame_size;
+        uint32_t channels, sample_rate, frame_size, bit_rate;
         void print() const { log_d("AudioArgs: c(%d), sr(%d), s(%d).",
                                    channels, sample_rate, frame_size); }
     } audio_args;
@@ -949,7 +953,7 @@ namespace x {
             ic_ctx->width = image.width;
             ic_ctx->height = image.height;
             ic_ctx->time_base = {1, image.fps<=0?30:(int32_t)image.fps};
-            ic_ctx->bit_rate = 512000;
+            ic_ctx->bit_rate = image.bit_rate;
             ic_ctx->gop_size = 10;
             ic_ctx->qmin = 10;
             ic_ctx->qmax = 51;
@@ -1080,7 +1084,7 @@ namespace x {
 
             ac_ctx->codec_id = a_codec->id;
             ac_ctx->codec_type = AVMEDIA_TYPE_AUDIO;
-            ac_ctx->bit_rate = 128000;
+            ac_ctx->bit_rate = audio.bit_rate;
             ac_ctx->sample_rate = audio.sample_rate;
             ac_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
             ac_ctx->channels = audio.channels;
@@ -1344,7 +1348,6 @@ namespace x {
             if (ic_ctx != nullptr) avcodec_close(ic_ctx);
             if (ic_ctx != nullptr) avcodec_free_context(&ic_ctx);
             ic_ctx = nullptr;
-
             if (a_swr_ctx != nullptr) swr_free(&a_swr_ctx);
             a_swr_ctx = nullptr;
             if (a_frm != nullptr) av_frame_free(&a_frm);
@@ -1352,7 +1355,6 @@ namespace x {
             if (ac_ctx != nullptr) avcodec_close(ac_ctx);
             if (ac_ctx != nullptr) avcodec_free_context(&ac_ctx);
             ac_ctx = nullptr;
-
             if (vf_ctx != nullptr) avformat_free_context(vf_ctx);
             vf_ctx = nullptr;
         }
@@ -3174,7 +3176,7 @@ namespace x {
 
     public:
         void getImageArgs(image_args &img) const {
-            img = image_args(width, height, 4, fps);
+            img = image_args(width, height, 4, fps, 4000000);
         }
 
     public:
@@ -3255,7 +3257,8 @@ namespace x {
         void getAudioArgs(audio_args &aud) const {
             aud = audio_args(audio->getChannels(),
                              audio->getSampleRate(),
-                             audio->getFrameSize());
+                             audio->getFrameSize(),
+                             128000);
         }
 
     public:
@@ -3332,15 +3335,17 @@ namespace x {
                 }
                 bool ok = false;
                 ImageFrame img;
-                imgQ->try_dequeue(img);
-                ok |= !(h264 == nullptr) && h264->encodeImage(std::forward<ImageFrame>(img));
+                if (imgQ->try_dequeue(img)) {
+                    ok |= !(h264 == nullptr) && h264->encodeImage(std::forward<ImageFrame>(img));
+                }
                 AudioFrame aud;
-                audQ->try_dequeue(aud);
-                ok |= !(h264 == nullptr) && h264->encodeAudio(std::forward<AudioFrame>(aud));
+                if (audQ->try_dequeue(aud)) {
+                    ok |= !(h264 == nullptr) && h264->encodeAudio(std::forward<AudioFrame>(aud));
+                }
                 if (!ok) std::this_thread::sleep_for(std::chrono::microseconds (1));
             }
             log_d("EncodeWorker[%d@%ld] encode thread exit.", worker->id, worker->_time);
-            if (!worker->exited)worker->completeCallback(worker->encoder, worker->id);
+            if (!worker->exited) worker->completeCallback(worker->encoder, worker->id);
         }
 
     private:
@@ -3353,8 +3358,8 @@ namespace x {
         long _time;
 
     private:
-        int32_t                     id;
-        std::atomic_bool            exited;
+        int32_t          id;
+        std::atomic_bool exited;
 
     private:
         void (*completeCallback)(VideoEncoder&, int32_t);
