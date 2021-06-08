@@ -271,11 +271,11 @@ namespace x {
     class ImageFrame {
     public:
         ImageFrame(): ori(0), width(0), height(0), cache(nullptr),
-                      faces(), fFaceCenter(), pts(0), tmpdB(0) {}
+                      faces(), fFaceCenter(), colctMs(0), pts(0), tmpdB(0) {}
 
         ImageFrame(int32_t w, int32_t h, bool perch = false): ori(0), width(w), height(h),
                                                               cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                              faces(), fFaceCenter(), pts(0), tmpdB(0) {
+                                                              faces(), fFaceCenter(), colctMs(0), pts(0), tmpdB(0) {
             if (cache == nullptr) {
                 log_e("ImageFrame malloc image cache fail.");
             } else if (FileRoot != nullptr) {
@@ -302,7 +302,7 @@ namespace x {
         ImageFrame(ImageFrame &&frame) noexcept: ori(frame.ori),
                                                  width(frame.width), height(frame.height),
                                                  cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                 faces(), fFaceCenter(), pts(frame.pts), tmpdB(frame.tmpdB) {
+                                                 faces(), fFaceCenter(), colctMs(frame.colctMs), pts(frame.pts), tmpdB(frame.tmpdB) {
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
             faces = frame.faces;
             fFaceCenter = frame.fFaceCenter;
@@ -311,7 +311,7 @@ namespace x {
         ImageFrame(const ImageFrame &frame) noexcept: ori(frame.ori),
                                                       width(frame.width), height(frame.height),
                                                       cache((uint32_t*)malloc(sizeof(uint32_t)*width*height)),
-                                                      faces(), fFaceCenter(), pts(frame.pts), tmpdB(frame.tmpdB) {
+                                                      faces(), fFaceCenter(), colctMs(frame.colctMs), pts(frame.pts), tmpdB(frame.tmpdB) {
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
             faces = frame.faces;
             fFaceCenter = frame.fFaceCenter;
@@ -328,6 +328,7 @@ namespace x {
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
             faces = frame.faces;
             fFaceCenter = frame.fFaceCenter;
+            colctMs = frame.colctMs;
             pts = frame.pts;
             tmpdB = frame.tmpdB;
             return *this;
@@ -344,6 +345,7 @@ namespace x {
             if (cache) { memcpy(cache, frame.cache, sizeof(uint32_t) * width * height); }
             faces = frame.faces;
             fFaceCenter = frame.fFaceCenter;
+            colctMs = frame.colctMs;
             pts = frame.pts;
             tmpdB = frame.tmpdB;
             return *this;
@@ -449,6 +451,7 @@ namespace x {
         cv::Point fFaceCenter;
 
     public:
+        long      colctMs;
         uint64_t  pts;
         int32_t   tmpdB;
     };
@@ -1938,6 +1941,7 @@ namespace x {
                 if (checkRecording != nullptr && checkRecording() && frameCompleted != nullptr) {
                     ImageFrame of;
                     paint->draw(nf, &of);
+                    of.colctMs = nf.colctMs;
                     frameCompleted(std::forward<ImageFrame>(of));
                 } else {
                     paint->draw(nf);
@@ -2143,6 +2147,10 @@ namespace x {
             if (status != AMEDIA_OK) {
                 return false;
             }
+
+            struct timeval tv{};
+            gettimeofday(&tv, nullptr);
+            frame.colctMs = tv.tv_sec * 1000 + tv.tv_usec / 1000;
 
             status = AImage_getFormat(yuv_args.image, &yuv_args.format);
             if (status != AMEDIA_OK || yuv_args.format != AIMAGE_FORMAT_YUV_420_888) {
@@ -3120,6 +3128,8 @@ namespace x {
                     dt.copyTo(roi);
                 } break;
             }
+            auto& ff = collector->camFrames.front();
+            frame.colctMs = ff->colctMs;
             postRendererImageFrame(frame);
         }
 
@@ -3361,7 +3371,7 @@ namespace x {
                         imgQ(std::make_shared<ImageQueue>()),
                         audQ(std::make_shared<AudioQueue>()),
                         encodeRunnable(std::make_shared<std::atomic_bool>(false)),
-                        workers(), imgMs(0), imgFps(0), imgPts(0), audPts(0), h264(nullptr) {
+                        workers(), imgMs(0), imgFpsMs(0), imgPts(0), audPts(0), h264(nullptr) {
             log_d("VideoEncoder created.");
         }
 
@@ -3373,17 +3383,8 @@ namespace x {
     public:
         void appendImageFrame(ImageFrame &&frm) {
             if (frm.available()) {
-                if (imgMs == 0) {
-                    struct timeval tv{};
-                    gettimeofday(&tv, nullptr);
-                    imgMs = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-                } else {
-                    struct timeval tv{};
-                    gettimeofday(&tv, nullptr);
-                    long ms = tv.tv_sec * 1000 + tv.tv_usec / 1000 - imgMs;
-                    float fpsMs = 1000.0f / imgFps;
-                    imgPts = (float)ms / fpsMs;
-                }
+                long ms = frm.colctMs - imgMs;
+                imgPts = (float)ms / imgFpsMs;
                 frm.pts = imgPts;
                 imgQ->enqueue(std::forward<ImageFrame>(frm));
             }
@@ -3407,7 +3408,10 @@ namespace x {
             for (auto& worker : workers) { worker.second->exit();worker.second.reset(); }
             workers.clear();
             log_d("VideoEncoder started: %s.", name.c_str());
-            imgFps = img.fps;
+            struct timeval tv{};
+            gettimeofday(&tv, nullptr);
+            imgMs = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            imgFpsMs = 1000.0f / img.fps;
             h264 = std::make_shared<H264>(name, img, aud);
             encodeRunnable = std::make_shared<std::atomic_bool>(true);
             int32_t id = workers.size();
@@ -3474,7 +3478,7 @@ namespace x {
         std::shared_ptr<std::atomic_bool>                encodeRunnable;
         std::map<int32_t, std::shared_ptr<EncodeWorker>> workers;
         long                                             imgMs;
-        int32_t                                          imgFps;
+        float                                            imgFpsMs;
         std::atomic_uint64_t                             imgPts, audPts;
 
     private:
