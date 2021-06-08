@@ -36,6 +36,8 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavdevice/avdevice.h>
 #include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libswresample/swresample.h>
@@ -97,20 +99,23 @@ namespace x {
      *
      */
     typedef struct audio_args {
-        audio_args(): channels(0), sample_rate(0), frame_size(0), bit_rate(0) {}
-        audio_args(uint32_t c, uint32_t s, uint32_t f, uint32_t b)
-                :channels(c), sample_rate(s), frame_size(f), bit_rate(b) {}
+        audio_args(): channels(0), sample_rate(0), frame_size(0), bit_rate(0), lonom_params() {}
+        audio_args(uint32_t c, uint32_t s, uint32_t f, uint32_t b, std::string&& lon="I=-16:tp=-1.5:LRA=11")
+                :channels(c), sample_rate(s), frame_size(f), bit_rate(b), lonom_params(lon) {}
         audio_args(audio_args &&args) noexcept
                 :channels(args.channels), sample_rate(args.sample_rate),
-                 frame_size(args.frame_size), bit_rate(args.bit_rate) {}
+                 frame_size(args.frame_size), bit_rate(args.bit_rate),
+                 lonom_params(std::string(args.lonom_params)) {}
         audio_args(const audio_args &args) noexcept
                 :channels(args.channels), sample_rate(args.sample_rate),
-                 frame_size(args.frame_size), bit_rate(args.bit_rate) {}
+                 frame_size(args.frame_size), bit_rate(args.bit_rate),
+                 lonom_params(std::string(args.lonom_params)) {}
         audio_args& operator=(audio_args &&args) noexcept {
             channels = args.channels;
             sample_rate = args.sample_rate;
             frame_size = args.frame_size;
             bit_rate = args.bit_rate;
+            lonom_params = args.lonom_params;
             return *this;
         }
         audio_args& operator=(const audio_args &args) noexcept {
@@ -118,11 +123,13 @@ namespace x {
             sample_rate = args.sample_rate;
             frame_size = args.frame_size;
             bit_rate = args.bit_rate;
+            lonom_params = args.lonom_params;
             return *this;
         }
         uint32_t channels, sample_rate, frame_size, bit_rate;
-        void print() const { log_d("AudioArgs: c(%d), sr(%d), s(%d).",
-                                   channels, sample_rate, frame_size); }
+        std::string lonom_params;
+        void print() const { log_d("AudioArgs: c(%d), sr(%d), s(%d), br(%d).",
+                                   channels, sample_rate, frame_size, bit_rate); }
     } audio_args;
 
 
@@ -466,23 +473,23 @@ namespace x {
      */
     class AudioFrame {
     public:
-        AudioFrame(): offset(0), size(0), cache(nullptr), pts(0), channels(2) {
+        AudioFrame(): offset(0), size(0), cache(nullptr), channels(2) {
         }
 
         explicit AudioFrame(int32_t sz, uint32_t cls): offset(0), size(sz),
                                                        cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
-                                                       pts(0), channels(cls) {
+                                                       channels(cls) {
         }
 
         AudioFrame(AudioFrame&& frame) noexcept: offset(frame.offset), size(frame.size),
                                                  cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
-                                                 pts(frame.pts), channels(frame.channels) {
+                                                 channels(frame.channels) {
             if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
         }
 
         AudioFrame(const AudioFrame &frame): offset(frame.offset), size(frame.size),
                                              cache((uint8_t*)malloc(sizeof(uint8_t)*size)),
-                                             pts(frame.pts), channels(frame.channels) {
+                                             channels(frame.channels) {
             if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
         }
 
@@ -493,7 +500,6 @@ namespace x {
                 cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
-            pts = frame.pts;
             channels = frame.channels;
             return *this;
         }
@@ -505,7 +511,6 @@ namespace x {
                 cache = (uint8_t *) malloc(sizeof(uint8_t) * size);
             }
             if (cache) { memcpy(cache, frame.cache, sizeof(uint8_t)*size); }
-            pts = frame.pts;
             channels = frame.channels;
             return *this;
         }
@@ -599,7 +604,6 @@ namespace x {
         uint8_t *cache;
 
     public:
-        uint64_t pts;
         uint32_t channels;
     };
 
@@ -843,9 +847,12 @@ namespace x {
                                vf_ctx(nullptr), ic_ctx(nullptr), i_stm(nullptr),
                                i_sws_ctx(nullptr), i_rgb_frm(nullptr), i_yuv_frm(nullptr),
                                ac_ctx(nullptr), a_stm(nullptr), a_swr_ctx(nullptr), a_frm(nullptr),
-                               i_h264bsfc(av_bitstream_filter_init("h264_mp4toannexb")),
-                               a_aac_adtstoasc(av_bitstream_filter_init("aac_adtstoasc")),
-                               i_pts(0), a_pts(0), a_encode_offset(0), a_encode_length(0), a_encode_cache(nullptr) {
+//                               i_h264bsfc(av_bitstream_filter_init("h264_mp4toannexb")),
+//                               a_aac_adtstoasc(av_bitstream_filter_init("aac_adtstoasc")),
+                               a_pts(0), a_encode_offset(0), a_encode_length(0), a_encode_cache(nullptr),
+                               lonom_use(false), lonom_graph(nullptr), lonom_abuffer_ctx(nullptr), lonom_loudnorm_ctx(nullptr),
+                               lonom_aformat_ctx(nullptr), lonom_abuffersink_ctx(nullptr),
+                               lonom_encode_offset(0), lonom_encode_length(0), lonom_encode_cache(nullptr) {
             log_d("H264[%s] created.", name.c_str());
             image.print();
             audio.print();
@@ -872,13 +879,20 @@ namespace x {
 
         bool encodeAudio(AudioFrame &&frame) {
             if (vf_ctx != nullptr && frame.available()) {
-                return prepareAudioFrame(frame);
+                if (lonom_use) {
+                    return prepareLoudnormFrame(frame);
+                } else {
+                    return prepareAudioFrame(frame);
+                }
             } else {
                 return false;
             }
         }
 
         void complete() {
+            if (lonom_use) {
+                flushLoudnormFrame();
+            }
             flushImageFrame();
             flushAudioFrame();
             if (vf_ctx != nullptr) {
@@ -898,6 +912,9 @@ namespace x {
                 release();
                 return;
             }
+
+            lonom_use = audio.lonom_params.length() > 0 && initLoudnormCtx();
+            log_d("H264[%s] audio Loudnorm able: %d.", name.c_str(), lonom_use);
 
             if (!initImageEncodeCtx()) {
                 return;
@@ -929,6 +946,131 @@ namespace x {
                 return;
             }
             log_d("H264[%s] init_video_encode vf_ctx stream num: %d.", name.c_str(), vf_ctx->nb_streams);
+        }
+
+        bool initLoudnormCtx() {
+            lonom_graph = avfilter_graph_alloc();
+            if (lonom_graph == nullptr) {
+                log_e("H264[%s] avfilter_graph_alloc graph fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            const AVFilter *abuffer = avfilter_get_by_name("abuffer");
+            if (abuffer == nullptr) {
+                log_e("H264[%s] avfilter_get_by_name abuffer fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            const AVFilter *loudnorm = avfilter_get_by_name("loudnorm");
+            if (loudnorm == nullptr) {
+                log_e("H264[%s] avfilter_get_by_name loudnorm fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            const AVFilter *aformat = avfilter_get_by_name("aformat");
+            if (aformat == nullptr) {
+                log_e("H264[%s] avfilter_get_by_name aformat fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            const AVFilter *abuffersink = avfilter_get_by_name("abuffersink");
+            if (abuffersink == nullptr) {
+                log_e("H264[%s] avfilter_get_by_name abuffersink fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            lonom_abuffer_ctx = avfilter_graph_alloc_filter(lonom_graph, abuffer, "src_buffer");
+            if (lonom_abuffer_ctx == nullptr) {
+                log_e("H264[%s] avfilter_graph_alloc_filter abuffer_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            lonom_loudnorm_ctx = avfilter_graph_alloc_filter(lonom_graph, loudnorm, "loudnorm");
+            if (lonom_loudnorm_ctx == nullptr) {
+                log_e("H264[%s] avfilter_graph_alloc_filter loudnorm_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            lonom_aformat_ctx = avfilter_graph_alloc_filter(lonom_graph, aformat, "out_aformat");
+            if (lonom_aformat_ctx == nullptr) {
+                log_e("H264[%s] avfilter_graph_alloc_filter aformat_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            lonom_abuffersink_ctx = avfilter_graph_alloc_filter(lonom_graph, abuffersink, "sink");
+            if (lonom_abuffersink_ctx == nullptr) {
+                log_e("H264[%s] avfilter_graph_alloc_filter abuffersink_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            char ch_layout[64];
+            av_get_channel_layout_string(ch_layout, sizeof(ch_layout), audio.channels, av_get_default_channel_layout(audio.channels));
+            av_opt_set(lonom_abuffer_ctx, "channel_layout", ch_layout, AV_OPT_SEARCH_CHILDREN);
+            av_opt_set_sample_fmt(lonom_abuffer_ctx, "sample_fmt", AV_SAMPLE_FMT_S16, AV_OPT_SEARCH_CHILDREN);
+            av_opt_set_q(lonom_abuffer_ctx, "time_base", {1, (int32_t)audio.sample_rate }, AV_OPT_SEARCH_CHILDREN);
+            av_opt_set_int(lonom_abuffer_ctx, "sample_rate", audio.sample_rate, AV_OPT_SEARCH_CHILDREN);
+            av_opt_set_int(lonom_abuffer_ctx, "channels", audio.channels, AV_OPT_SEARCH_CHILDREN);
+            if (avfilter_init_str(lonom_abuffer_ctx, nullptr) < 0) {
+                log_e("H264[%s] avfilter_init_str abuffer_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            if (avfilter_init_str(lonom_loudnorm_ctx, audio.lonom_params.c_str()) < 0) {
+                log_e("H264[%s] avfilter_init_str loudnorm_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            char out_str[64];
+            snprintf(out_str, sizeof(out_str),
+                     "sample_fmts=%s:sample_rates=%d:channel_layouts=0x%" PRIx64,
+                     av_get_sample_fmt_name(AV_SAMPLE_FMT_S16), audio.sample_rate,
+                     av_get_default_channel_layout(audio.channels));
+            if (avfilter_init_str(lonom_aformat_ctx, out_str) < 0) {
+                log_e("H264[%s] avfilter_init_str aformat_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            if (avfilter_init_str(lonom_abuffersink_ctx, nullptr) < 0) {
+                log_e("H264[%s] avfilter_init_str abuffersink_ctx fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            int32_t res =       avfilter_link(lonom_abuffer_ctx, 0, lonom_loudnorm_ctx, 0);
+            if (res >= 0) res = avfilter_link(lonom_loudnorm_ctx, 0, lonom_aformat_ctx, 0);
+            if (res >= 0) res = avfilter_link(lonom_aformat_ctx, 0, lonom_abuffersink_ctx, 0);
+            if (res < 0) {
+                log_e("H264[%s] avfilter_link fail.", name.c_str());
+                releaseLoudnorm();
+                return false;
+            }
+
+            if ((res = avfilter_graph_config(lonom_graph, nullptr)) < 0) {
+                char err[64];
+                av_strerror(res, err, 64);
+                log_e("H264[%s] avfilter_graph_config fail: [%d] %s.", name.c_str(), res, err);
+                releaseLoudnorm();
+                return false;
+            }
+
+            lonom_encode_offset = 0;
+            lonom_encode_length = 1024 * 2 * audio.channels;
+            lonom_encode_cache = (uint8_t *) malloc(sizeof(uint8_t) * lonom_encode_length);
+
+            log_d("H264[%s] init Loudnorm(%s) success.", name.c_str(), audio.lonom_params.c_str());
+            return true;
         }
 
         bool initImageEncodeCtx() {
@@ -1060,7 +1202,6 @@ namespace x {
                 return false;
             }
 
-            i_pts = 0;
             log_d("H264[%s] init_image_encode success, time_base: %d/%d.",
                   name.c_str(), ic_ctx->time_base.num, ic_ctx->time_base.den);
             return true;
@@ -1181,6 +1322,75 @@ namespace x {
             return true;
         }
 
+        AVFrame* createLoudnormFrame() {
+            AVFrame* frame = av_frame_alloc();
+            if (frame == nullptr) {
+                log_e("H264[%s] av_frame_alloc en_frame fail.", name.c_str());
+                return nullptr;
+            }
+            frame->nb_samples = 1024;
+            frame->sample_rate = audio.sample_rate;
+            frame->format = AV_SAMPLE_FMT_S16;
+            frame->channel_layout = av_get_default_channel_layout(audio.channels);
+            int32_t res = av_frame_get_buffer(frame, 0);
+            if (res < 0) {
+                log_e("H264[%s] av_frame_get_buffer en_frame fail: %d.", name.c_str(), res);
+                av_frame_free(&frame);
+                return nullptr;
+            }
+            res = av_frame_make_writable(frame);
+            if (res < 0) {
+                log_e("H264[%s] av_frame_make_writable en_frame fail: %d.", name.c_str(), res);
+                av_frame_free(&frame);
+                return nullptr;
+            }
+            return frame;
+        }
+
+        bool prepareLoudnormFrame(AudioFrame &frame) {
+            int32_t size = 0;
+            uint8_t *data = nullptr;
+            frame.get(&size, &data);
+            if (size <= 0 || data == nullptr) {
+                return false;
+            }
+            if (size <= lonom_encode_length) {
+                if (lonom_encode_offset + size >= lonom_encode_length) {
+                    int32_t count = lonom_encode_length - lonom_encode_offset;
+                    memcpy(lonom_encode_cache + lonom_encode_offset, data, sizeof(uint8_t) * count);
+                    encodeLoudnormFrame();
+                    int32_t data_offset = count;
+                    count = size - count;
+                    if (count > 0) {
+                        memcpy(lonom_encode_cache, data + data_offset, sizeof(uint8_t) * count);
+                        lonom_encode_offset += count;
+                    }
+                } else {
+                    memcpy(lonom_encode_cache + lonom_encode_offset, data, sizeof(uint8_t) * size);
+                    lonom_encode_offset += size;
+                }
+            } else {
+                int32_t data_offset = 0;
+                while(true) {
+                    int32_t count = lonom_encode_length - lonom_encode_offset;
+                    if (data_offset + count >= size) {
+                        int32_t cpc = size - data_offset;
+                        memcpy(lonom_encode_cache + lonom_encode_offset, data + data_offset, sizeof(uint8_t) * cpc);
+                        data_offset += cpc;
+                        lonom_encode_offset += cpc;
+                        if (lonom_encode_offset == lonom_encode_length) { encodeLoudnormFrame(); }
+                        break;
+                    } else {
+                        memcpy(lonom_encode_cache + lonom_encode_offset, data + data_offset, sizeof(uint8_t) * lonom_encode_length);
+                        data_offset += lonom_encode_length;
+                        lonom_encode_offset += lonom_encode_length;
+                        encodeLoudnormFrame();
+                    }
+                }
+            }
+            return true;
+        }
+
         bool prepareImageFrame(ImageFrame &frame) {
             int32_t w = 0, h = 0;
             uint32_t *data = nullptr;
@@ -1237,6 +1447,21 @@ namespace x {
             return true;
         }
 
+        void encodeLoudnormFrame() {
+            AVFrame *frame = createLoudnormFrame();
+            memcpy(frame->data[0], lonom_encode_cache, sizeof(uint8_t) * lonom_encode_length);
+            int32_t res = av_buffersrc_add_frame_flags(lonom_abuffer_ctx, frame, AV_BUFFERSRC_FLAG_PUSH);
+            if (res < 0) {
+                char err[64];
+                av_strerror(res, err, 64);
+                log_e("H264[%s] av_buffersrc_add_frame encode fail[%d]%s.", name.c_str(), res, err);
+            } else {
+                receiveLoudnormPacket(false);
+            }
+            av_frame_free(&frame);
+            lonom_encode_offset = 0;
+        }
+
         void encodeImageFrame(int32_t w, int32_t h, uint32_t *data, int32_t pts) {
             avpicture_fill((AVPicture *)i_rgb_frm, (uint8_t *)data, AV_PIX_FMT_RGBA, w, h);
             int32_t res = sws_scale(i_sws_ctx, i_rgb_frm->data, i_rgb_frm->linesize,
@@ -1277,6 +1502,18 @@ namespace x {
             a_encode_offset = 0;
         }
 
+        void flushLoudnormFrame() {
+            if (lonom_encode_offset > 0) { encodeLoudnormFrame(); }
+            int32_t res = av_buffersrc_add_frame_flags(lonom_abuffer_ctx, nullptr, AV_BUFFERSRC_FLAG_PUSH);
+            if (res < 0) {
+                char err[64];
+                av_strerror(res, err, 64);
+                log_e("H264[%s] av_buffersrc_add_frame flush fail: (%d) %s", name.c_str(), res, err);
+                return;
+            }
+            receiveLoudnormPacket(true);
+        }
+
         void flushImageFrame() {
             int32_t res = avcodec_send_frame(ic_ctx, nullptr);
             if (res < 0) {
@@ -1298,6 +1535,49 @@ namespace x {
                 return;
             }
             receiveAudioPacket();
+        }
+
+        void receiveLoudnormPacket(bool flush) {
+            if (flush) {
+                int32_t again = 9999; // TODO:Improve!
+                while(again-- > 0) {
+                    AVFrame *frame = av_frame_alloc();
+                    int32_t res = av_buffersink_get_frame_flags(lonom_abuffersink_ctx, frame, AV_BUFFERSINK_FLAG_NO_REQUEST);
+                    if (res < 0) {
+                        av_frame_free(&frame);
+                        std::this_thread::sleep_for(std::chrono::microseconds(1));
+                        break;
+                    } else {
+                        uint8_t *aud_data = nullptr;
+                        AudioFrame frm(frame->linesize[0], audio.channels);
+                        frm.get(nullptr, &aud_data);
+                        memcpy(aud_data, frame->data[0], sizeof(uint8_t) * frame->linesize[0]);
+                        av_frame_free(&frame);
+                        if (lonom_use) {
+                            prepareAudioFrame(frm);
+                        }
+                    }
+                }
+            } else {
+                AVFrame *frame = av_frame_alloc();
+                int32_t res = av_buffersink_get_frame(lonom_abuffersink_ctx, frame);
+                if (res == AVERROR_EOF) {
+                    av_frame_free(&frame);
+                    return;
+                }
+                if (res < 0) {
+                    av_frame_free(&frame);
+                    return;
+                }
+                uint8_t *aud_data = nullptr;
+                AudioFrame frm(frame->linesize[0], audio.channels);
+                frm.get(nullptr, &aud_data);
+                memcpy(aud_data, frame->data[0], sizeof(uint8_t) * frame->linesize[0]);
+                av_frame_free(&frame);
+                if (lonom_use) {
+                    prepareAudioFrame(frm);
+                }
+            }
         }
 
         void receiveImagePacket() {
@@ -1339,6 +1619,7 @@ namespace x {
         }
 
         void release() {
+            releaseLoudnorm();
             if (i_sws_ctx != nullptr) sws_freeContext(i_sws_ctx);
             i_sws_ctx = nullptr;
             if (i_rgb_frm != nullptr) av_frame_free(&i_rgb_frm);
@@ -1357,6 +1638,23 @@ namespace x {
             ac_ctx = nullptr;
             if (vf_ctx != nullptr) avformat_free_context(vf_ctx);
             vf_ctx = nullptr;
+            if (a_encode_cache != nullptr) free(a_encode_cache);
+            a_encode_cache = nullptr;
+        }
+
+        void releaseLoudnorm() {
+            if (lonom_abuffer_ctx != nullptr) avfilter_free(lonom_abuffer_ctx);
+            lonom_abuffer_ctx = nullptr;
+            if (lonom_loudnorm_ctx != nullptr) avfilter_free(lonom_loudnorm_ctx);
+            lonom_loudnorm_ctx = nullptr;
+            if (lonom_aformat_ctx != nullptr) avfilter_free(lonom_aformat_ctx);
+            lonom_aformat_ctx = nullptr;
+            if (lonom_abuffersink_ctx != nullptr) avfilter_free(lonom_abuffersink_ctx);
+            lonom_abuffersink_ctx = nullptr;
+            if (lonom_graph != nullptr) avfilter_graph_free(&lonom_graph);
+            lonom_graph = nullptr;
+            if (lonom_encode_cache != nullptr) free(lonom_encode_cache);
+            lonom_encode_cache = nullptr;
         }
 
     private:
@@ -1381,14 +1679,27 @@ namespace x {
         AVStream                 *a_stm;
         SwrContext               *a_swr_ctx;
         AVFrame                  *a_frm;
-        AVBitStreamFilterContext *i_h264bsfc;
-        AVBitStreamFilterContext *a_aac_adtstoasc;
+//        AVBitStreamFilterContext *i_h264bsfc;
+//        AVBitStreamFilterContext *a_aac_adtstoasc;
 
     private:
-        int32_t  i_pts, a_pts;
+        int32_t  a_pts;
         int32_t  a_encode_offset;
         int32_t  a_encode_length;
         uint8_t *a_encode_cache;
+
+    private:
+        bool             lonom_use;
+        AVFilterGraph   *lonom_graph;
+        AVFilterContext *lonom_abuffer_ctx;
+        AVFilterContext *lonom_loudnorm_ctx;
+        AVFilterContext *lonom_aformat_ctx;
+        AVFilterContext *lonom_abuffersink_ctx;
+
+    private:
+        int32_t  lonom_encode_offset;
+        int32_t  lonom_encode_length;
+        uint8_t *lonom_encode_cache;
     };
 
 
@@ -3303,18 +3614,14 @@ namespace x {
     class VideoEncoder;
     class EncodeWorker {
     public:
-        EncodeWorker(int32_t i,
-                     void (*callback)(VideoEncoder&, int32_t),
-                     VideoEncoder &en): id(i), exited(false),
-                                        completeCallback(callback), encoder(en) {
-            struct timeval tv{};
-            gettimeofday(&tv, nullptr);
-            _time = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-            log_d("EncodeWorker[%d@%ld] created.", id, _time);
+        EncodeWorker(void(*callback)(VideoEncoder&), VideoEncoder &en): exited(false),
+                                                                        completeCallback(callback),
+                                                                        encoder(en) {
+            log_d("EncodeWorker] created.");
         }
 
         ~EncodeWorker() {
-            log_d("EncodeWorker[%d@%ld] release.", id, _time);
+            log_d("EncodeWorker release.");
         }
 
     public:
@@ -3328,7 +3635,7 @@ namespace x {
                                    const std::shared_ptr<ImageQueue> &imgQ,
                                    const std::shared_ptr<AudioQueue> &audQ,
                                    const std::shared_ptr<std::atomic_bool>& runnable) {
-            log_d("EncodeWorker[%d@%ld] encode thread start.", worker->id, worker->_time);
+            log_d("EncodeWorker encode thread start.");
             while(*runnable || imgQ->size_approx() > 0 || audQ->size_approx() > 0) {
                 if (worker->exited) {
                     break;
@@ -3336,16 +3643,22 @@ namespace x {
                 bool ok = false;
                 ImageFrame img;
                 if (imgQ->try_dequeue(img)) {
-                    ok |= !(h264 == nullptr) && h264->encodeImage(std::forward<ImageFrame>(img));
+                    ok |= !(h264 == nullptr) &&
+                            h264->encodeImage(std::forward<ImageFrame>(img));
                 }
-                AudioFrame aud;
-                if (audQ->try_dequeue(aud)) {
-                    ok |= !(h264 == nullptr) && h264->encodeAudio(std::forward<AudioFrame>(aud));
+                int aud_count = audQ->size_approx();
+                while(aud_count-- > 0) {
+                    AudioFrame aud;
+                    if (audQ->try_dequeue(aud)) {
+                        ok |= !(h264 == nullptr) &&
+                                h264->encodeAudio(std::forward<AudioFrame>(aud));
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(1));
                 }
-                if (!ok) std::this_thread::sleep_for(std::chrono::microseconds (1));
+                if (!ok) std::this_thread::sleep_for(std::chrono::microseconds(1));
             }
-            log_d("EncodeWorker[%d@%ld] encode thread exit.", worker->id, worker->_time);
-            if (!worker->exited) worker->completeCallback(worker->encoder, worker->id);
+            if (!worker->exited) worker->completeCallback(worker->encoder);
+            log_d("EncodeWorker encode thread exit.");
         }
 
     private:
@@ -3355,14 +3668,10 @@ namespace x {
         EncodeWorker& operator=(const EncodeWorker&) = delete;
 
     private:
-        long _time;
-
-    private:
-        int32_t          id;
         std::atomic_bool exited;
 
     private:
-        void (*completeCallback)(VideoEncoder&, int32_t);
+        void (*completeCallback)(VideoEncoder&);
         VideoEncoder &encoder;
     };
 
@@ -3373,10 +3682,12 @@ namespace x {
     class VideoEncoder {
     public:
         VideoEncoder(): name(),
-                        imgQ(std::make_shared<ImageQueue>()),
-                        audQ(std::make_shared<AudioQueue>()),
-                        encodeRunnable(std::make_shared<std::atomic_bool>(false)),
-                        workers(), imgMs(0), imgFpsMs(0), imgPts(0), audPts(0), h264(nullptr) {
+                        imgSrcQ(std::make_shared<ImageQueue>()),
+                        audSrcQ(std::make_shared<AudioQueue>()),
+                        imgDstQ(std::make_shared<ImageQueue>()),
+                        audDstQ(std::make_shared<AudioQueue>()),
+                        enRunnable(std::make_shared<std::atomic_bool>(false)),
+                        enWorker(nullptr), imgStartMs(0), imgFpsMs(0), h264(nullptr) {
             log_d("VideoEncoder created.");
         }
 
@@ -3388,51 +3699,44 @@ namespace x {
     public:
         void appendImageFrame(ImageFrame &&frm) {
             if (frm.available()) {
-                long ms = frm.colctMs - imgMs;
-                imgPts = (float)ms / imgFpsMs;
-                frm.pts = imgPts;
-                imgQ->enqueue(std::forward<ImageFrame>(frm));
+                long ms = frm.colctMs - imgStartMs;
+                frm.pts = (float)ms / imgFpsMs;
+                imgSrcQ->enqueue(std::forward<ImageFrame>(frm));
             }
         }
 
         void appendAudioFrame(AudioFrame &&frm) {
             if (frm.available()) {
-                frm.pts = audPts; audPts += frm.getSize() / frm.channels / 2;
-                audQ->enqueue(std::forward<AudioFrame>(frm));
+                audSrcQ->enqueue(std::forward<AudioFrame>(frm));
             }
         }
 
     public:
         void start(std::string &&nme, image_args &img, audio_args &aud) {
-            if (*encodeRunnable) {
+            if (*enRunnable) {
                 log_e("VideoEncoder running - %s.", name.c_str());
                 return;
             }
             name = nme;
-            clearImageQ(); clearAudioQ();
-            for (auto& worker : workers) { worker.second->exit();worker.second.reset(); }
-            workers.clear();
+            clearImageQ();
+            clearAudioQ();
             log_d("VideoEncoder started: %s.", name.c_str());
             struct timeval tv{};
             gettimeofday(&tv, nullptr);
-            imgMs = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            imgStartMs = tv.tv_sec * 1000 + tv.tv_usec / 1000;
             imgFpsMs = 1000.0f / img.fps;
             h264 = std::make_shared<H264>(name, img, aud);
-            encodeRunnable = std::make_shared<std::atomic_bool>(true);
-            int32_t id = workers.size();
-            workers[id] = std::make_shared<EncodeWorker>(id, VideoEncoder::onEncodeWorkerCompleted, *this);
-            for (const auto& worker : workers) {
-                std::thread et(EncodeWorker::encodeRunnable,
-                               worker.second, h264, imgQ, audQ, encodeRunnable);
-                et.detach();
-            }
+            enRunnable = std::make_shared<std::atomic_bool>(true);
+            enWorker = std::make_shared<EncodeWorker>(VideoEncoder::onEnWorkerCompleted, *this);
+            std::thread et(EncodeWorker::encodeRunnable, enWorker, h264, imgSrcQ, audSrcQ, enRunnable);
+            et.detach();
         }
 
         void stop() {
-            if (!*encodeRunnable) return;
+            if (!*enRunnable) return;
             log_d("VideoEncoder request stop: %s.", name.c_str());
-            *encodeRunnable = false;
-            encodeRunnable = std::make_shared<std::atomic_bool>(false);
+            *enRunnable = false;
+            enRunnable = std::make_shared<std::atomic_bool>(false);
         }
 
     private:
@@ -3443,30 +3747,32 @@ namespace x {
         }
 
     private:
-        static void onEncodeWorkerCompleted(VideoEncoder &encoder, int32_t id) {
-            encoder.workers.erase(id);
-            if (encoder.workers.empty()) { encoder.completed(); }
+        static void onEnWorkerCompleted(VideoEncoder &encoder) {
+            encoder.completed();
         }
 
     private:
         void clearImageQ() {
             ImageFrame f;
-            while (imgQ->try_dequeue(f));
-            imgPts = 0;
+            while (imgSrcQ->try_dequeue(f));
+            while (imgDstQ->try_dequeue(f));
         }
 
         void clearAudioQ() {
             AudioFrame f;
-            while (audQ->try_dequeue(f));
-            audPts = 0;
+            while (audSrcQ->try_dequeue(f));
+            while (audDstQ->try_dequeue(f));
         }
 
         void release() {
-            *encodeRunnable = false;
-            encodeRunnable = std::make_shared<std::atomic_bool>(false);
-            clearImageQ(); clearAudioQ();
-            for (auto& worker : workers) { worker.second->exit();worker.second.reset(); }
-            workers.clear();
+            *enRunnable = false;
+            enRunnable = std::make_shared<std::atomic_bool>(false);
+            clearImageQ();
+            clearAudioQ();
+            if (enWorker != nullptr) {
+                enWorker->exit();
+            }
+            enWorker.reset();
             h264.reset();
         }
 
@@ -3478,13 +3784,14 @@ namespace x {
 
     private:
         std::string                                      name;
-        std::shared_ptr<ImageQueue>                      imgQ;
-        std::shared_ptr<AudioQueue>                      audQ;
-        std::shared_ptr<std::atomic_bool>                encodeRunnable;
-        std::map<int32_t, std::shared_ptr<EncodeWorker>> workers;
-        long                                             imgMs;
+        std::shared_ptr<ImageQueue>                      imgSrcQ;
+        std::shared_ptr<AudioQueue>                      audSrcQ;
+        std::shared_ptr<ImageQueue>                      imgDstQ;
+        std::shared_ptr<AudioQueue>                      audDstQ;
+        std::shared_ptr<std::atomic_bool>                enRunnable;
+        std::shared_ptr<EncodeWorker>                    enWorker;
+        long                                             imgStartMs;
         float                                            imgFpsMs;
-        std::atomic_uint64_t                             imgPts, audPts;
 
     private:
         std::shared_ptr<H264> h264;
